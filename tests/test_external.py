@@ -29,11 +29,19 @@ printf '%s\\n' "{\\"session_id\\":\\"s\\",\\"response\\":\\"gemini $W $A secret=
 """
 
 
+FAKE_AGY = "#!/bin/sh\n" + PROBE + """
+case "$*" in *"--mode plan"*) A=plan;; *"--mode auto"*) A=auto;; *) A=none;; esac
+echo "$*" | grep -q -- "--model m2" && M=m2 || M=default
+printf '%s\\n' "{\\"conversation_id\\":\\"c\\",\\"status\\":\\"SUCCESS\\",\\"response\\":\\"agy $W $A $M secret=$S\\",\\"usage\\":{\\"total_tokens\\":777}}"
+"""
+
+
 @pytest.fixture
 def work(tmp_path, monkeypatch):
     work = tmp_path / "work"
     work.mkdir()
-    for name, script in (("copilot", FAKE_COPILOT), ("gemini", FAKE_GEMINI)):
+    monkeypatch.setattr(external, "_agy_signed_in", lambda: True)
+    for name, script in (("copilot", FAKE_COPILOT), ("gemini", FAKE_GEMINI), ("agy", FAKE_AGY)):
         path = work / name
         path.write_text(script)
         path.chmod(0o755)
@@ -67,17 +75,29 @@ def test_gemini_modes_and_usage(work):
     assert "writable yolo" in write.text
 
 
+def test_agy_modes_and_usage(work):
+    read = external.run("agy:m2", "hi", work)
+    assert read.ok and read.tokens == 777 and "readonly plan m2 secret=none" in read.text
+    assert not (work / "probe.txt").exists()
+    write = external.run("agy", "hi", work, write=True)
+    assert "writable auto default" in write.text and (work / "probe.txt").exists()
+
+
 def test_failures_do_not_raise(work, tmp_path):
     (work / "gemini").write_text('#!/bin/sh\necho \'{"error":{"message":"quota exceeded"},"stats":{}}\'\n')
     assert external.run("gemini", "hi", work).error == "gemini: quota exceeded"
     (work / "copilot").write_text('#!/bin/sh\necho \'{"type":"result","exitCode":1}\'\n')
     assert not external.run("copilot", "hi", work).ok
+    (work / "agy").write_text('#!/bin/sh\necho \'{"status":"ERROR","response":"x"}\'\n')
+    assert external.run("agy", "hi", work).error == "agy status ERROR"
     (work / "copilot").write_text("#!/bin/sh\nsleep 5\n")
     assert "timed out" in external.run("copilot", "hi", work, timeout=1).error
 
 
 def test_check_explains_what_is_missing(work, monkeypatch, tmp_path):
-    assert external.check("copilot") == "" and external.check("gemini") == ""
+    assert external.check("copilot") == "" and external.check("gemini") == "" and external.check("agy") == ""
+    monkeypatch.setattr(external, "_agy_signed_in", lambda: False)
+    assert "agy is not signed in" in external.check("agy")
     monkeypatch.setattr(external, "_copilot_token", lambda: "")
     assert "no GitHub token" in external.check("copilot")
     monkeypatch.delenv("GEMINI_API_KEY")
@@ -86,6 +106,7 @@ def test_check_explains_what_is_missing(work, monkeypatch, tmp_path):
     assert "not found" in external.check("gemini")
     with pytest.raises(ValueError, match="unknown provider"):
         external.split_spec("bard")
+    assert external.split_spec("agy:gemini-3.8-flash-high") == ("agy", "gemini-3.8-flash-high")
 
 
 def test_parse_findings():

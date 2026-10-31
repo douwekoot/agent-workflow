@@ -1,4 +1,4 @@
-"""Other vendors' agent CLIs, run headless: GitHub Copilot and Gemini.
+"""Other vendors' agent CLIs, run headless: GitHub Copilot, Gemini and Antigravity (agy).
 
 They serve as second opinions and cheap workers. They get no workflow tools. The driver
 hands them a prompt and takes their text back, then does all the bookkeeping itself.
@@ -10,7 +10,7 @@ bus is hidden, and the working directory is read-only unless the job writes code
 The provider's login directory stays readable and writable, so a prompt-injected agent
 could read that provider's token.
 
-A provider spec is "copilot", "gemini", or either with a model: "gemini:gemini-3-pro".
+A provider spec is "copilot", "gemini" or "agy", or one with a model: "agy:gemini-3.8-flash-high".
 """
 
 import json
@@ -20,10 +20,10 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-PROVIDERS = ("copilot", "gemini")
+PROVIDERS = ("copilot", "gemini", "agy")
 TIMEOUT = 1800
 HOME = Path.home()
-LOGIN_DIRS = {"copilot": [".copilot"], "gemini": [".gemini"]}
+LOGIN_DIRS = {"copilot": [".copilot"], "gemini": [".gemini"], "agy": [".gemini"]}
 INSTALL_DIRS = [".local/bin", ".local/lib"]  # where npm install --prefix ~/.local puts the CLIs
 
 
@@ -59,6 +59,10 @@ def _copilot_token():
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
+def _agy_signed_in():
+    return (HOME / ".gemini/antigravity-cli/antigravity-oauth-token").exists()
+
+
 def check(spec):
     """Why this provider can't run right now, or "" when it can. Called before a run starts."""
     provider, _ = split_spec(spec)
@@ -69,6 +73,8 @@ def check(spec):
         return f"{provider} CLI not found (tried {binary})"
     if provider == "copilot" and not _copilot_token():
         return "no GitHub token: run gh auth login, or set COPILOT_GITHUB_TOKEN"
+    if provider == "agy" and not _agy_signed_in():
+        return f"agy is not signed in: run {binary} once and sign in with Google"
     # Login with Google no longer works: Google rejects the CLI for consumer accounts.
     if provider == "gemini" and not os.environ.get("GEMINI_API_KEY"):
         return "gemini needs GEMINI_API_KEY, a key from https://aistudio.google.com/apikey"
@@ -104,6 +110,13 @@ def _copilot_argv(binary, prompt, write, model):
 def _gemini_argv(binary, prompt, write, model):
     argv = [binary, "-p", prompt, "--output-format", "json", "--skip-trust",
             "--approval-mode", "yolo" if write else "plan"]
+    return argv + (["--model", model] if model else [])
+
+
+def _agy_argv(binary, prompt, write, model):
+    # Headless agy can't answer permission prompts, so a mode that asks would silently
+    # decline every edit and command. Plan is read-only; auto approves by itself.
+    argv = [binary, "-p", prompt, "--output-format", "json", "--mode", "auto" if write else "plan"]
     return argv + (["--model", model] if model else [])
 
 
@@ -149,7 +162,24 @@ def _parse_gemini(stdout):
     return Result(bool(text), text, tokens, error="" if text else "gemini gave no answer")
 
 
-ADAPTERS = {"copilot": (_copilot_argv, _parse_copilot), "gemini": (_gemini_argv, _parse_gemini)}
+def _parse_agy(stdout):
+    """One JSON object: status, response text and usage."""
+    start = stdout.find("{")
+    try:
+        data, _ = json.JSONDecoder().raw_decode(stdout[start:]) if start >= 0 else (None, 0)
+    except json.JSONDecodeError:
+        data = None
+    if not isinstance(data, dict):
+        return Result(False, error="agy printed no JSON")
+    tokens = (data.get("usage") or {}).get("total_tokens", 0)
+    text = data.get("response") or ""
+    if data.get("status") != "SUCCESS" or not text:
+        return Result(False, text, tokens, error=f"agy status {data.get('status')}")
+    return Result(True, text, tokens)
+
+
+ADAPTERS = {"copilot": (_copilot_argv, _parse_copilot), "gemini": (_gemini_argv, _parse_gemini),
+            "agy": (_agy_argv, _parse_agy)}
 
 
 def run(spec, prompt, cwd, write=False, timeout=TIMEOUT):

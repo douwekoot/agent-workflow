@@ -107,15 +107,16 @@ headless Claude Code process (`claude -p`). It uses your Claude subscription, no
 - Don't put repos or `$AGENT_WORKFLOW_HOME` under `~/.claude`: the sandbox never allows
   writes there.
 
-## Copilot and Gemini as second opinions and cheap workers
+## Copilot, Antigravity and Gemini as second opinions and cheap workers
 
-The driver can hand some jobs to GitHub Copilot or the Gemini CLI. Both are opt-in with
-`--use NAME=PROVIDER[:MODEL]`, repeatable:
+The driver can hand some jobs to GitHub Copilot, Antigravity (`agy`) or the Gemini CLI. All
+are opt-in with `--use NAME=PROVIDER[:MODEL]`, repeatable, with provider `copilot`, `agy`
+or `gemini`:
 
 ```sh
 .venv/bin/agent-workflow-drive "<request>" --repo /path --gate "pytest -q" \
-  --use second_opinion=gemini --use plan_critic=gemini --use test_writer=copilot \
-  --use coder_low=copilot --use scout=gemini --use scribe=gemini
+  --use second_opinion=agy --use plan_critic=agy --use test_writer=copilot \
+  --use coder_low=copilot --use scout=agy --use scribe=agy
 ```
 
 | `--use` name | What the other CLI does |
@@ -140,7 +141,10 @@ The driver can hand some jobs to GitHub Copilot or the Gemini CLI. Both are opt-
 - **Ledger.** Their tokens are listed under `external` and never count against the Claude
   budgets, since they come out of another quota. Copilot also logs its premium requests.
 - **Setup.** `npm install -g --prefix ~/.local @github/copilot @google/gemini-cli`. Copilot
-  uses your `gh` login. Gemini needs `GEMINI_API_KEY`, a key from Google AI Studio: Login
+  uses your `gh` login. Antigravity: install `agy` and sign in once (the driver looks for
+  `~/.gemini/antigravity-cli/antigravity-oauth-token`). It is slow to start, a few seconds
+  per call. Write jobs run in its `auto` mode and read-only jobs in `plan` mode. Gemini
+  needs `GEMINI_API_KEY`, a key from Google AI Studio: Login
   with Google no longer works, because Google rejects the Gemini CLI for consumer accounts
   and points them to Antigravity. An AI Studio key is billed or rate-limited apart from a
   Google AI subscription. The driver checks both before it starts.
