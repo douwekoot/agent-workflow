@@ -33,6 +33,18 @@ def test_happy_path_with_test_writer(store, run):
     assert step(store, run, "T1", "reviewer", "done")["state"] == "done"
 
 
+def test_verifier_rejecting_all_findings_finishes_task(store, run):
+    store.create_task(run, spec("T1"))
+    for role in ("coder", "gate"):
+        step(store, run, "T1", role, "done")
+    findings = store.put_artifact(run, "findings", '{"claim": "off by one"}', "T1")
+    step(store, run, "T1", "reviewer", "failed", artifacts=[findings])
+    packet = store.claim(run, "T1", "verifier")
+    assert packet["inputs"]["artifacts"] == [findings]
+    result = store.report(run, "T1", "verifier", "done", "rejected 1: handled at line 9")
+    assert (result["state"], result["fix_loops"]) == ("done", 0)
+
+
 def test_roles_cannot_skip_steps(store, run):
     store.create_task(run, spec("T1"))
     with pytest.raises(WorkflowError, match="cannot claim"):
@@ -57,7 +69,8 @@ def test_fix_loop_cap_escalates(store, run):
     assert step(store, run, "T1", "gate", "failed")["state"] == "fixing"
     step(store, run, "T1", "coder", "done")
     step(store, run, "T1", "gate", "done")
-    assert step(store, run, "T1", "reviewer", "failed")["state"] == "fixing"
+    assert step(store, run, "T1", "reviewer", "failed")["state"] == "verifying"
+    assert step(store, run, "T1", "verifier", "failed")["state"] == "fixing"
     step(store, run, "T1", "coder", "done")
     result = step(store, run, "T1", "gate", "failed")
     assert result == {**result, "state": "escalated", "fix_loops": 3}

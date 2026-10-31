@@ -29,8 +29,9 @@ playbook for the orchestrator. Protocol:
 3. For each task: task_claim(role) returns the context packet the subagent needs — give the
    subagent only that packet, not the conversation. The subagent works, stores large output
    with artifact_put, and the result goes back with task_report (summary <= 400 chars).
-   Order per task: [test_writer] -> coder -> gate_run -> reviewer -> done; gate or review
-   failures send it back to the coder until the fix-loop cap, then it is escalated.
+   Order per task: [test_writer] -> coder -> gate_run -> reviewer -> done. Review findings
+   go to a verifier first; gate failures and confirmed findings send the task back to the
+   coder until the fix-loop cap, then it is escalated.
    After every subagent, the orchestrator books its real token use with usage_report.
 4. Escalated tasks need task_replan or a decision from the user.
 5. When all tasks are done: task_merge each, then the integrator and scribe finish up.
@@ -104,13 +105,13 @@ def task_create(run_id: str, spec: dict) -> dict:
 @tool
 def task_list(run_id: str, state: str | None = None) -> dict:
     """List tasks, optionally filtered by state (planned, tests_written, coded, reviewing,
-    fixing, done, escalated)."""
+    verifying, fixing, done, escalated)."""
     return {"tasks": store.list_tasks(run_id, state)}
 
 
 @tool
 def task_claim(run_id: str, task_id: str, role: str) -> dict:
-    """Claim a task for a role (test_writer, coder, reviewer) and get its context packet.
+    """Claim a task for a role (test_writer, coder, reviewer, verifier) and get its context packet.
     Coders and test writers get a git worktree to work in."""
     if role == "gate":
         raise WorkflowError("use gate_run for the gate")
@@ -152,7 +153,8 @@ def results_get(run_id: str, task_id: str | None = None) -> dict:
 def task_report(run_id: str, task_id: str, role: str, status: str, summary: str,
                 artifacts: list[str] | None = None) -> dict:
     """Report a claimed task's result. status: done, failed or escalate. For a reviewer,
-    done = no confirmed findings, failed = confirmed findings (stored as an artifact)."""
+    done = no findings, failed = findings (stored as an artifact). For a verifier, done =
+    no finding confirmed, failed = confirmed findings (stored as an artifact)."""
     return store.report(run_id, task_id, role, status, summary, artifacts or [])
 
 
@@ -202,7 +204,7 @@ def task_merge(run_id: str, task_id: str) -> dict:
 @tool
 def run_report(run_id: str, role: str, status: str, summary: str,
                artifacts: list[str] | None = None) -> dict:
-    """Log work not tied to one task (scout, architect, verifier, integrator, scribe)."""
+    """Log work not tied to one task (scout, architect, integrator, scribe)."""
     store.record_run_result(run_id, role, status, summary, artifacts or [])
     return {"recorded": role}
 

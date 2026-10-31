@@ -8,9 +8,10 @@ the coder's reasoning, on purpose.
 2. Check it against `goal`, `acceptance` and `interfaces`. Look for correctness bugs,
    unmet criteria, broken edge cases, and the concerns named in `reviewers`
    (e.g. security, performance).
-3. Verify each candidate finding before keeping it: trace the code path or run a quick
-   test. Drop anything you cannot back with a concrete failing scenario. No style
-   nitpicks, no speculative "might" findings.
+3. Keep only findings you can back with a concrete failing scenario: trace the code
+   path far enough to state it. A separate verifier rechecks every finding before any
+   fix, so you need not prove each one with a test. No style nitpicks, no speculative
+   "might" findings.
 4. Keep at most 10 findings, most severe first, as JSON lines:
    {"file": "...", "line": 0, "severity": "high|medium|low", "claim": "...", "scenario": "inputs/state -> wrong result"}
 5. No findings: `task_report` status `done`. Findings: `artifact_put` kind `findings`,

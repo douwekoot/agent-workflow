@@ -67,6 +67,7 @@ CLAIMABLE = {
     "tests_written": {"coder"},
     "coded": {"gate"},
     "reviewing": {"reviewer"},
+    "verifying": {"verifier"},
     "fixing": {"coder"},
 }
 
@@ -77,7 +78,10 @@ NEXT_STATE = {
     ("gate", "done"): "reviewing",
     ("gate", "failed"): "fixing",
     ("reviewer", "done"): "done",
-    ("reviewer", "failed"): "fixing",
+    ("reviewer", "failed"): "verifying",
+    # The verifier rechecks the reviewer's findings so false positives never cost a fix loop.
+    ("verifier", "done"): "done",
+    ("verifier", "failed"): "fixing",
 }
 
 TASK_ROLES = set().union(*CLAIMABLE.values())
@@ -255,7 +259,7 @@ class Store:
             "reads": spec["reads"],
             "interfaces": spec["interfaces"],
             "acceptance": spec["acceptance"],
-            "reviewers": spec["reviewers"] if role == "reviewer" else None,
+            "reviewers": spec["reviewers"] if role in ("reviewer", "verifier") else None,
             "repo_map": self.repo_map(run_id),
             "inputs": self._latest_artifacts(run_id, task_id),
             "budget": budget,
@@ -265,8 +269,9 @@ class Store:
         """Record a claimed role's result, charge the ledger and advance the task.
 
         Status meanings per role: test_writer/coder "done" = work finished; gate "done" =
-        all checks pass, "failed" = a check failed; reviewer "done" = no confirmed findings,
-        "failed" = confirmed findings (put them in an artifact). "escalate" always escalates.
+        all checks pass, "failed" = a check failed; reviewer "done" = no findings, "failed" =
+        findings (in an artifact); verifier "done" = none confirmed, "failed" = confirmed
+        findings (in an artifact). "escalate" always escalates.
         """
         task = self._task(run_id, task_id)
         if task["claimed_by"] != role:

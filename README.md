@@ -5,8 +5,9 @@ A local MCP server that coordinates multi-role agent runs. It is Stage 1 of
 spawns subagents. This server holds the shared state and enforces the rules:
 
 - **Per-task state machine.** Each task moves through
-  `planned → [tests_written] → coded → reviewing → done`.
-  When the gate or the review fails, the task goes to `fixing`. After `max_fix_loops`
+  `planned → [tests_written] → coded → reviewing → [verifying] → done`.
+  Review findings go to a verifier, which drops false positives. When the gate fails or
+  the verifier confirms a finding, the task goes to `fixing`. After `max_fix_loops`
   failures it moves to `escalated` and needs a replan or a decision.
 - **Claims.** A role can only work on a task that is in the right state, and only one role
   at a time. The gate can't be skipped, and dependencies must be `done` first.
@@ -53,8 +54,8 @@ role instructions and context packet from the server, so none of that passes thr
 orchestrator's context. Role instructions live in `agent_workflow/prompts/`, one Markdown
 file per role plus `common.md`, which all roles share.
 
-Suggested models: haiku for scout and scribe; sonnet for test writer, coder, reviewer and
-integrator; opus for the architect and for reviewing high-risk tasks.
+Suggested models: haiku for scout and scribe; sonnet for test writer, coder, reviewer,
+verifier and integrator; opus for the architect and for reviewing high-risk tasks.
 
 ## Tools
 
@@ -64,7 +65,7 @@ integrator; opus for the architect and for reviewing high-risk tasks.
 | `repo_map_put` | scout |
 | `task_create`, `task_replan` | architect / orchestrator |
 | `task_list`, `ledger_get`, `results_get` | orchestrator, scribe |
-| `task_claim`, `task_report`, `task_release` | test writer, coder, reviewer |
+| `task_claim`, `task_report`, `task_release` | test writer, coder, reviewer, verifier |
 | `role_brief` | scout, architect, integrator, scribe (instructions + run context) |
 | `gate_run` | orchestrator (runs the checks; no LLM) |
 | `task_merge` | integrator |
@@ -76,8 +77,6 @@ Prompt: `orchestrate(request)` is the orchestrator's playbook.
 
 ## Not built yet
 
-- A separate verifier role. For now the reviewer must check each finding itself and drop
-  anything it can't back with a concrete failing scenario.
 - Prompt caching across subagents is limited while Claude Code does the spawning: it
   builds each subagent's prompt itself. Stage 2 controls the prompt prefix directly.
 - Stage 2: a driver that calls the Anthropic API itself and walks the same state machine.

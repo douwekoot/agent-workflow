@@ -19,7 +19,7 @@ from the project files. Then call `workflow_start`.
 Every subagent gets the same short spawn prompt. Its real instructions and context come
 from the server when it claims its work. Do not add other context.
 
-Task roles (test_writer, coder, reviewer):
+Task roles (test_writer, coder, reviewer, verifier):
 > You are the {{role}} in agent-workflow run {{run_id}}, task {{task_id}}. Call the
 > agent-workflow `task_claim` tool with run_id={{run_id}}, task_id={{task_id}},
 > role={{role}} first and follow the instructions it returns.
@@ -29,7 +29,8 @@ Run roles (scout, architect, integrator, scribe):
 > `role_brief` tool with run_id={{run_id}}, role={{role}} first and follow the
 > instructions it returns.
 
-Model per role: scout, scribe → haiku. test_writer, coder, reviewer, integrator → sonnet.
+Model per role: scout, scribe → haiku. test_writer, coder, reviewer, verifier,
+integrator → sonnet.
 architect → opus, and reviewer → opus for tasks with risk "high".
 
 ## 3. Run the pipeline
@@ -41,6 +42,7 @@ architect → opus, and reviewer → opus for tasks with risk "high".
    - `tests_written` or `fixing` → spawn a **coder**.
    - `coded` → call `gate_run` yourself (no subagent needed).
    - `reviewing` → spawn a **reviewer**.
+   - `verifying` → spawn a **verifier** (it checks the reviewer's findings).
    Start every task whose dependencies are done at the same time, in parallel. Don't
    wait for a whole stage to finish; move each task on as soon as its step finishes.
    Skip tasks that are already claimed.
