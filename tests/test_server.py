@@ -133,6 +133,16 @@ def test_tool_errors_are_reported(server, repo, tmp_path):
     assert "not done" in call_error(server, "task_merge", run_id=run, task_id="T1")
 
 
+def test_start_needs_git_identity(server, repo, monkeypatch, tmp_path):
+    for key in ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
+        monkeypatch.delenv(key)
+    monkeypatch.setenv("HOME", str(tmp_path))  # no global git config
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    git(repo, "config", "user.useConfigOnly", "true")
+    assert "no commit identity" in call_error(
+        server, "workflow_start", request="x", repo=str(repo), gate_commands=[])
+
+
 def test_stdio_server_lists_tools(tmp_path):
     """Start the real server process and talk to it over stdio like a client would."""
     from mcp import ClientSession, StdioServerParameters

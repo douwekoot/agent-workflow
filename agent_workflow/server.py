@@ -85,6 +85,7 @@ def workflow_start(request: str, repo: str, gate_commands: list[str],
     e.g. ["npm run lint", "npm test"]. repo is the absolute path of the git repository."""
     if not (Path(repo) / ".git").exists():
         raise WorkflowError(f"{repo} is not a git repository")
+    gate.check_identity(repo)
     run_id = store.start_run(request, budget, max_fix_loops, repo, gate_commands)
     return {"run_id": run_id}
 

@@ -41,6 +41,16 @@ def current_branch(repo):
     return proc.stdout.strip()
 
 
+def check_identity(repo):
+    """Agents commit in worktrees; fail at the start of a run, not in the first coder."""
+    proc = _git(repo, "var", "GIT_AUTHOR_IDENT")
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git has no commit identity for {repo}; set one with "
+            f"git -C {repo} config user.name '...' and git -C {repo} config user.email '...'"
+        )
+
+
 def branch_name(run_id, task_id):
     return f"aw/{run_id}/{task_id}"
 
