@@ -69,9 +69,9 @@ def check(spec):
         return f"{provider} CLI not found (tried {binary})"
     if provider == "copilot" and not _copilot_token():
         return "no GitHub token: run gh auth login, or set COPILOT_GITHUB_TOKEN"
-    if provider == "gemini" and not (os.environ.get("GEMINI_API_KEY")
-                                     or (HOME / ".gemini/settings.json").exists()):
-        return f"gemini is not signed in: run {binary} once and choose Login with Google"
+    # Login with Google no longer works: Google rejects the CLI for consumer accounts.
+    if provider == "gemini" and not os.environ.get("GEMINI_API_KEY"):
+        return "gemini needs GEMINI_API_KEY, a key from https://aistudio.google.com/apikey"
     return ""
 
 
@@ -164,7 +164,7 @@ def run(spec, prompt, cwd, write=False, timeout=TIMEOUT):
            "LANG": os.environ.get("LANG", "C.UTF-8"), "TERM": "dumb", "NO_COLOR": "1"}
     if provider == "copilot":
         env["COPILOT_GITHUB_TOKEN"] = _copilot_token()
-    if provider == "gemini" and os.environ.get("GEMINI_API_KEY"):
+    if provider == "gemini":
         env["GEMINI_API_KEY"] = os.environ["GEMINI_API_KEY"]
     argv = _sandbox(build(_binary(provider), prompt, write, model), cwd, write, provider, env)
     try:

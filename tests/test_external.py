@@ -81,8 +81,7 @@ def test_check_explains_what_is_missing(work, monkeypatch, tmp_path):
     monkeypatch.setattr(external, "_copilot_token", lambda: "")
     assert "no GitHub token" in external.check("copilot")
     monkeypatch.delenv("GEMINI_API_KEY")
-    monkeypatch.setattr(external, "HOME", tmp_path / "empty-home")
-    assert "not signed in" in external.check("gemini")
+    assert "needs GEMINI_API_KEY" in external.check("gemini")
     monkeypatch.setenv("AGENT_WORKFLOW_GEMINI", str(tmp_path / "missing"))
     assert "not found" in external.check("gemini")
     with pytest.raises(ValueError, match="unknown provider"):

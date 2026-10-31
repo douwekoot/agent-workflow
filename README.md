@@ -140,8 +140,10 @@ The driver can hand some jobs to GitHub Copilot or the Gemini CLI. Both are opt-
 - **Ledger.** Their tokens are listed under `external` and never count against the Claude
   budgets, since they come out of another quota. Copilot also logs its premium requests.
 - **Setup.** `npm install -g --prefix ~/.local @github/copilot @google/gemini-cli`. Copilot
-  uses your `gh` login. For Gemini run `gemini` once and choose Login with Google, or set
-  `GEMINI_API_KEY`. The driver checks both before it starts.
+  uses your `gh` login. Gemini needs `GEMINI_API_KEY`, a key from Google AI Studio: Login
+  with Google no longer works, because Google rejects the Gemini CLI for consumer accounts
+  and points them to Antigravity. An AI Studio key is billed or rate-limited apart from a
+  Google AI subscription. The driver checks both before it starts.
 
 ## Gate sandbox
 
