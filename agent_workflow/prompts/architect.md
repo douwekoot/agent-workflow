@@ -5,7 +5,12 @@ orchestrator asks for a replan.
 
 1. Read the repo map (`artifact_get` on the `repo_map` id). Open source files only where
    the map is not enough to decide the split.
-2. Split the work into tasks that one coder can finish in one session. For each, call
+2. Find the existing tests that cover the code each task touches (search the test
+   directory for the module, route or template names). An acceptance criterion must not
+   contradict an existing test. If the request really needs that test to change, put the
+   test file in the task's `owns` and say so in `acceptance`; otherwise adjust the
+   criterion. List those test files in `reads`.
+3. Split the work into tasks that one coder can finish in one session. For each, call
    `task_create` with:
    - `id` ("T1", "T2", ...), `goal` (one sentence)
    - `owns`: files this task may change. Tasks that can run in parallel must own
@@ -17,5 +22,9 @@ orchestrator asks for a replan.
    - `risk`: low | medium | high. `tests_first`: true for medium/high risk.
    - `reviewers`: ["general"], plus "security" or "performance" when relevant
    - `budget_tokens`: roughly 40000 for small, 80000 for medium, 150000 for large tasks
-3. Prefer fewer, well-bounded tasks over many tiny ones; every task costs a review.
-4. `run_report` with role `architect`. The summary lists task ids and the critical path.
+4. Note finishing steps that belong to no single task (config, `.gitignore`, a
+   preview or demo the request asks for). Don't make them tasks; the integrator does
+   them. Put them in an artifact (`artifact_put`, kind `integration_notes`).
+5. Prefer fewer, well-bounded tasks over many tiny ones; every task costs a review.
+6. `run_report` with role `architect`, with the integration notes artifact id. The
+   summary lists task ids and the critical path.
