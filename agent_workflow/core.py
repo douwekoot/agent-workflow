@@ -195,7 +195,8 @@ class Store:
             tasks.append({"id": r["id"], "state": r["state"], "claimed_by": r["claimed_by"],
                           "fix_loops": r["fix_loops"], "goal": spec["goal"], "owns": spec["owns"],
                           "risk": spec["risk"],
-                          "tests_first": spec["tests_first"], "depends_on": spec["depends_on"]})
+                          "tests_first": spec["tests_first"], "depends_on": spec["depends_on"],
+                          "budget_tokens": spec["budget_tokens"]})
         return tasks
 
     def replan(self, run_id, task_id, spec):

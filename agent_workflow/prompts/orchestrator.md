@@ -7,8 +7,10 @@ short summaries. You never read source code, diffs or logs yourself. Subagents d
 and their context is discarded when they finish.
 
 ## 0. Triage
-If the request is small (a few files, one subsystem, a clear change), do it directly
-without this workflow and stop here. Otherwise continue.
+Use the workflow only when the request splits into at least 3 pieces of work that each
+deserve their own review, or touches more than about 8 files across subsystems. Anything
+smaller (one subsystem, a clear change, a bug fix) costs more in orchestration than it
+saves: do it directly, without this workflow, and stop here. Otherwise continue.
 
 ## 1. Start
 Ask the user only for what you cannot find out: the repo path (default: the current
