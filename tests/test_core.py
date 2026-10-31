@@ -69,8 +69,25 @@ def test_escalate_and_replan(store, run):
     new = store.replan(run, "T1", {"goal": "smaller goal"})
     assert new["goal"] == "smaller goal" and new["owns"] == ["T1.py"]
     assert store.list_tasks(run)[0]["state"] == "planned"
-    with pytest.raises(WorkflowError, match="only escalated"):
-        store.replan(run, "T1", {})
+    with pytest.raises(WorkflowError, match="unknown spec keys owns_add"):
+        store.replan(run, "T1", {"owns_add": ["x.py"]})
+    with pytest.raises(WorkflowError, match="missing owns"):
+        store.replan(run, "T1", {"owns": []})
+    with pytest.raises(WorkflowError, match="itself"):
+        store.replan(run, "T1", {"depends_on": ["T1"]})
+
+
+def test_replan_keeps_progress_of_running_task(store, run):
+    store.create_task(run, spec("T1"))
+    step(store, run, "T1", "coder", "done")
+    step(store, run, "T1", "gate", "failed")
+    store.claim(run, "T1", "coder")
+    with pytest.raises(WorkflowError, match="claimed"):
+        store.replan(run, "T1", {"owns": ["T1.py", "test_T1.py"]})
+    store.release(run, "T1")
+    store.replan(run, "T1", {"owns": ["T1.py", "test_T1.py"]})
+    task = store.list_tasks(run)[0]
+    assert (task["state"], task["fix_loops"], task["owns"]) == ("fixing", 1, ["T1.py", "test_T1.py"])
 
 
 def test_dependencies_block_claims(store, run):
@@ -94,6 +111,8 @@ def test_spec_validation(store, run):
     store.create_task(run, spec("T1"))
     with pytest.raises(WorkflowError, match="already exists"):
         store.create_task(run, spec("T1"))
+    with pytest.raises(WorkflowError, match="unknown spec keys"):
+        store.create_task(run, spec("T2", owner="me"))
 
 
 def test_task_budget_refuses_claims(store, run):

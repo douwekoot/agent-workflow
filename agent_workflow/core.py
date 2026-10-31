@@ -85,6 +85,8 @@ ROLES = {"orchestrator", "scout", "architect", "test_writer", "coder", "gate",
          "reviewer", "verifier", "integrator", "scribe"}
 STATUSES = {"done", "failed", "escalate"}
 REQUIRED_SPEC_KEYS = ("id", "goal", "owns", "acceptance")
+SPEC_KEYS = {*REQUIRED_SPEC_KEYS, "reads", "interfaces", "depends_on", "risk", "tests_first",
+             "reviewers", "budget_tokens"}
 MAX_SUMMARY_CHARS = 400
 DEFAULT_TASK_BUDGET = 60_000
 BUDGET_WARNING_RATIO = 0.8
@@ -92,6 +94,12 @@ BUDGET_WARNING_RATIO = 0.8
 
 class WorkflowError(Exception):
     """A request the workflow refuses: bad input, wrong state, or over budget."""
+
+
+def _check_spec_keys(spec):
+    unknown = sorted(set(spec) - SPEC_KEYS)
+    if unknown:
+        raise WorkflowError(f"unknown spec keys {', '.join(unknown)}; allowed: {', '.join(sorted(SPEC_KEYS))}")
 
 
 class Store:
@@ -144,6 +152,7 @@ class Store:
 
     def create_task(self, run_id, spec):
         self._run(run_id)
+        _check_spec_keys(spec)
         missing = [k for k in REQUIRED_SPEC_KEYS if not spec.get(k)]
         if missing:
             raise WorkflowError(f"task spec missing {', '.join(missing)}")
@@ -180,22 +189,35 @@ class Store:
         for r in self.db.execute(query + " ORDER BY rowid", args):
             spec = json.loads(r["spec"])
             tasks.append({"id": r["id"], "state": r["state"], "claimed_by": r["claimed_by"],
-                          "fix_loops": r["fix_loops"], "goal": spec["goal"], "risk": spec["risk"],
+                          "fix_loops": r["fix_loops"], "goal": spec["goal"], "owns": spec["owns"],
+                          "risk": spec["risk"],
                           "tests_first": spec["tests_first"], "depends_on": spec["depends_on"]})
         return tasks
 
     def replan(self, run_id, task_id, spec):
-        """Replace an escalated task's spec and send it back to 'planned'."""
+        """Merge changes over a task's spec. Keys replace whole values, so pass the full new
+        `owns` list. An escalated task restarts at 'planned' with fresh fix loops; any other
+        unclaimed, unfinished task keeps its state, so its work so far is not thrown away."""
         task = self._task(run_id, task_id)
-        if task["state"] != "escalated":
-            raise WorkflowError(f"task {task_id} is {task['state']}, only escalated tasks can be replanned")
-        old = json.loads(task["spec"])
-        spec = {**old, **spec, "id": task_id}
+        if task["claimed_by"]:
+            raise WorkflowError(f"task {task_id} is claimed by {task['claimed_by']}; replan it once it is idle")
+        if task["state"] == "done":
+            raise WorkflowError(f"task {task_id} is done; add a new task instead")
+        _check_spec_keys(spec)
+        spec = {**json.loads(task["spec"]), **spec, "id": task_id}
+        missing = [k for k in REQUIRED_SPEC_KEYS if not spec.get(k)]
+        if missing:
+            raise WorkflowError(f"task spec missing {', '.join(missing)}")
+        for dep in spec["depends_on"]:
+            if dep == task_id:
+                raise WorkflowError(f"task {task_id} cannot depend on itself")
+            self._task(run_id, dep)
+        restart = task["state"] == "escalated"
         with self.db:
             self.db.execute(
-                "UPDATE tasks SET spec = ?, state = 'planned', claimed_by = NULL, fix_loops = 0 "
-                "WHERE run_id = ? AND id = ?",
-                (json.dumps(spec), run_id, task_id),
+                "UPDATE tasks SET spec = ?, state = ?, fix_loops = ? WHERE run_id = ? AND id = ?",
+                (json.dumps(spec), "planned" if restart else task["state"],
+                 0 if restart else task["fix_loops"], run_id, task_id),
             )
         return spec
 

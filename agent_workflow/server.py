@@ -165,7 +165,8 @@ def task_release(run_id: str, task_id: str) -> dict:
 
 @tool
 def task_replan(run_id: str, task_id: str, spec: dict) -> dict:
-    """Change an escalated task's spec (merged over the old one) and restart it."""
+    """Change an idle, unfinished task's spec. Keys replace whole values (send the full new
+    owns list; task_list shows the current one). Escalated tasks restart at planned."""
     return store.replan(run_id, task_id, spec)
 
 

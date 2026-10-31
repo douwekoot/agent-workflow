@@ -51,7 +51,8 @@ architect → opus, and reviewer → opus for tasks with risk "high".
    and spawn it again once.
 5. `escalated` tasks: read the last summary (`results_get` for that task). Then either
    `task_replan` with a smaller or clearer spec, or ask the user. Don't retry the same
-   spec unchanged.
+   spec unchanged. Replan keys replace whole values: to let a task touch one more file,
+   send the full `owns` list from `task_list` plus that file.
 6. Check `ledger_get` from time to time. If the run nears its budget, stop starting new
    tasks and tell the user.
 
