@@ -75,8 +75,31 @@ verifier and integrator; opus for the architect and for reviewing high-risk task
 
 Prompt: `orchestrate(request)` is the orchestrator's playbook.
 
-## Not built yet
+## Stage 2: the driver
 
-- Prompt caching across subagents is limited while Claude Code does the spawning: it
-  builds each subagent's prompt itself. Stage 2 controls the prompt prefix directly.
-- Stage 2: a driver that calls the Anthropic API itself and walks the same state machine.
+`agent-workflow-drive` runs a whole workflow without Claude Code. It walks the same state
+machine and calls the same tools in-process, but makes every model call itself through the
+Anthropic API:
+
+```sh
+.venv/bin/pip install -e ".[driver]"
+.venv/bin/agent-workflow-drive "<request>" --repo /path/to/repo --gate "pytest -q"
+.venv/bin/agent-workflow-drive --run <run_id>   # resume, e.g. after a task_replan
+```
+
+- **Exact ledger.** Every response's usage is booked, so budgets hold.
+- **Prompt caching.** Each agent's prefix is tools, then `common.md` plus the repo map
+  (shared by the whole run), then the role's instructions (shared within a role), with a
+  cache breakpoint after each. The conversation tail uses automatic caching. Each agent
+  logs its cache-read share.
+- **Models.** Haiku 5.5 for scout and scribe, Opus 5.5 for the architect and for reviewing
+  or verifying high-risk tasks, Sonnet 5.5 for the rest. Opus and Sonnet requests turn on
+  the API's server-side refusal fallback.
+- It stops and tells you when a task escalates, the budget runs out, or a plan has more
+  than 6 tasks (unless `--yes`). Fix it with the MCP tools, then resume with `--run`.
+- Tasks run one step at a time, not in parallel.
+- **Security:** agents' bash commands run unsandboxed as you, in the task's worktree. The
+  file editor is confined to that worktree. Run the driver in a container or VM for repos
+  you don't fully trust.
+
+Needs Anthropic credentials (`ANTHROPIC_API_KEY` or `ant auth login`).

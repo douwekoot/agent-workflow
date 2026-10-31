@@ -6,10 +6,12 @@ requires-python = ">=3.11"
 dependencies = ["mcp>=2.3,<3"]
 
 [project.optional-dependencies]
-test = ["pytest"]
+driver = ["anthropic>=2.3,<3"]
+test = ["pytest", "anthropic>=2.3,<3"]
 
 [project.scripts]
 agent-workflow-mcp = "agent_workflow.server:main"
+agent-workflow-drive = "agent_workflow.driver:main"
 
 [build-system]
 requires = ["setuptools>=68"]
