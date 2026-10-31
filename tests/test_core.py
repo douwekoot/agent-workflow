@@ -195,6 +195,38 @@ def test_packet_passes_previous_step_artifacts(store, run):
     assert store.get_artifact(packet["repo_map"])["content"] == "src/ -- everything"
 
 
+def test_external_usage_is_listed_but_not_budgeted(store, run):
+    store.create_task(run, spec("T1"))
+    store.charge(run, "coder", 5000, "T1")
+    store.charge(run, "second_opinion", 90_000, "T1", provider="gemini")
+    store.charge(run, "critic", 4000, provider="copilot")
+    ledger = store.ledger(run)
+    assert ledger["spent"] == 5000 and ledger["remaining"] == 95_000
+    assert ledger["by_role"] == {"coder": 5000} and ledger["by_task"] == {"T1": 5000}
+    assert ledger["external"] == {"gemini": 90_000, "copilot": 4000}
+    assert store.claim(run, "T1", "coder")["budget"]["task_remaining"] == 55_000
+
+
+def test_usage_table_from_before_providers_is_migrated(tmp_path):
+    import sqlite3
+    db = sqlite3.connect(tmp_path / "workflow.db")
+    db.executescript("""
+        CREATE TABLE usage (seq INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL,
+            task_id TEXT, role TEXT NOT NULL, tokens INTEGER NOT NULL, created REAL NOT NULL);
+        INSERT INTO usage (run_id, role, tokens, created) VALUES ('run-old', 'scout', 700, 0);
+    """)
+    db.commit()
+    db.close()
+    store = Store(tmp_path)
+    store.db.execute("INSERT INTO runs (id, request, budget, max_fix_loops, created) VALUES ('run-old', 'x', 9999, 2, 0)")
+    assert store.ledger("run-old")["spent"] == 700
+
+
+def test_specs_are_full(store, run):
+    store.create_task(run, spec("T1", interfaces=["f()"]))
+    assert store.specs(run)[0]["interfaces"] == ["f()"]
+
+
 def test_artifact_slices(store, run):
     artifact = store.put_artifact(run, "log", "0123456789")
     part = store.get_artifact(artifact, offset=3, length=4)

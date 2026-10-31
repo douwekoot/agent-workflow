@@ -48,7 +48,8 @@ CREATE TABLE IF NOT EXISTS usage (
     task_id TEXT,
     role TEXT NOT NULL,
     tokens INTEGER NOT NULL,
-    created REAL NOT NULL
+    created REAL NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'claude'
 );
 CREATE TABLE IF NOT EXISTS artifacts (
     id TEXT PRIMARY KEY,
@@ -86,7 +87,7 @@ NEXT_STATE = {
 
 TASK_ROLES = set().union(*CLAIMABLE.values())
 ROLES = {"orchestrator", "scout", "architect", "test_writer", "coder", "gate",
-         "reviewer", "verifier", "integrator", "scribe"}
+         "reviewer", "verifier", "integrator", "scribe", "critic", "second_opinion"}
 STATUSES = {"done", "failed", "escalate"}
 REQUIRED_SPEC_KEYS = ("id", "goal", "owns", "acceptance")
 SPEC_KEYS = {*REQUIRED_SPEC_KEYS, "reads", "interfaces", "depends_on", "risk", "tests_first",
@@ -114,6 +115,10 @@ class Store:
         self.db = sqlite3.connect(self.root / "workflow.db", check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(usage)")}
+        if "provider" not in columns:  # databases from before external providers
+            with self.db:
+                self.db.execute("ALTER TABLE usage ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude'")
 
     # --- runs -------------------------------------------------------------------------
 
@@ -198,6 +203,12 @@ class Store:
                           "tests_first": spec["tests_first"], "depends_on": spec["depends_on"],
                           "budget_tokens": spec["budget_tokens"]})
         return tasks
+
+    def specs(self, run_id):
+        """Full task specs, for roles that judge the plan itself."""
+        self._run(run_id)
+        return [json.loads(r["spec"]) for r in self.db.execute(
+            "SELECT spec FROM tasks WHERE run_id = ? ORDER BY rowid", (run_id,))]
 
     def replan(self, run_id, task_id, spec):
         """Merge changes over a task's spec. Keys replace whole values, so pass the full new
@@ -367,9 +378,11 @@ class Store:
 
     # --- ledger -----------------------------------------------------------------------
 
-    def charge(self, run_id, role, tokens, task_id=None):
+    def charge(self, run_id, role, tokens, task_id=None, provider="claude"):
         """Book tokens a subagent actually used, as measured by whoever ran it. Agents can't
-        see their own usage, so self-estimates were dropped: they were mostly 0."""
+        see their own usage, so self-estimates were dropped: they were mostly 0. Tokens of
+        another provider (Copilot, Gemini) are listed in the ledger but never count against
+        the Claude budgets: they come out of a different quota."""
         self._run(run_id)
         if role not in ROLES:
             raise WorkflowError(f"unknown role {role}")
@@ -379,12 +392,13 @@ class Store:
             self._task(run_id, task_id)
         with self.db:
             self.db.execute(
-                "INSERT INTO usage (run_id, task_id, role, tokens, created) VALUES (?, ?, ?, ?, ?)",
-                (run_id, task_id, role, tokens, time.time()),
+                "INSERT INTO usage (run_id, task_id, role, tokens, created, provider) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (run_id, task_id, role, tokens, time.time(), provider),
             )
 
     # Old runs booked self-estimates on results.tokens; new results store 0 there.
-    SPEND = ("SELECT run_id, task_id, role, tokens FROM usage UNION ALL "
+    SPEND = ("SELECT run_id, task_id, role, tokens FROM usage WHERE provider = 'claude' UNION ALL "
              "SELECT run_id, task_id, role, tokens FROM results")
 
     def _spent(self, run_id, task_id=None):
@@ -416,8 +430,11 @@ class Store:
             f"SELECT task_id, SUM(tokens) FROM ({self.SPEND}) WHERE run_id = ? AND task_id IS NOT NULL "
             "GROUP BY task_id", (run_id,))}
         spent = self._spent(run_id)
+        external = {r[0]: r[1] for r in self.db.execute(
+            "SELECT provider, SUM(tokens) FROM usage WHERE run_id = ? AND provider != 'claude' "
+            "GROUP BY provider", (run_id,))}
         return {"budget": run["budget"], "spent": spent, "remaining": run["budget"] - spent,
-                "by_role": by_role, "by_task": by_task}
+                "by_role": by_role, "by_task": by_task, "external": external}
 
     # --- artifacts --------------------------------------------------------------------
 

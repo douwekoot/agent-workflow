@@ -12,6 +12,9 @@ Every agent runs in Claude Code's bash sandbox: writes only inside its working d
 (the task worktree), no network, no unsandboxed fallback, and secrets dirs unreadable.
 File tools are confined to the working directory and web tools and subagents are off.
 
+Optionally (--use NAME=PROVIDER), some jobs go to GitHub Copilot or Gemini instead: see
+delegate.USE_CASES. They run in their own sandbox, and fall back to Claude if they fail.
+
 Run:  agent-workflow-drive "<request>" --repo PATH --gate "pytest -q" [--gate ...]
       agent-workflow-drive --run RUN_ID      (resume, e.g. after replanning an escalation)
 """
@@ -24,7 +27,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from . import delegate, external
 from . import server as mcp
+from .delegate import log
 from .server import PROMPTS
 
 MODELS = {"scout": "haiku", "scribe": "haiku", "architect": "opus"}
@@ -33,7 +38,8 @@ HIGH_RISK_MODEL = "opus"  # reviewer and verifier on risk "high" tasks
 # Claims, gates, replans and usage are the driver's job, as they are the orchestrator's.
 DRIVER_ONLY = {"workflow_start", "usage_report", "gate_run", "task_claim", "role_brief",
                "task_release", "task_replan"}
-SECRETS = ["~/.ssh", "~/.aws", "~/.gnupg"]
+# Other vendors' logins too: a Claude agent has no business with them.
+SECRETS = ["~/.ssh", "~/.aws", "~/.gnupg", "~/.gemini", "~/.copilot", "~/.config/gh"]
 SANDBOX = {"sandbox": {
     "enabled": True,
     "failIfUnavailable": True,          # never fall back to running bash unsandboxed
@@ -42,9 +48,14 @@ SANDBOX = {"sandbox": {
     "filesystem": {"denyRead": SECRETS},
 }}
 ALLOWED_TOOLS = ["Bash", "Read", "Glob", "Grep", "Edit(/**)", "Write(/**)", "mcp__agent-workflow"]
-DENIED_TOOLS = ["Agent", "WebFetch", "WebSearch",
-                *(f"Read({d}/**)" for d in SECRETS),
-                *(f"mcp__agent-workflow__{name}" for name in sorted(DRIVER_ONLY))]
+
+
+def denied_tools(role):
+    # The architect revises plans, so it alone may replan.
+    driver_only = DRIVER_ONLY - {"task_replan"} if role == "architect" else DRIVER_ONLY
+    return ["Agent", "WebFetch", "WebSearch", *(f"Read({d}/**)" for d in SECRETS),
+            *(f"mcp__agent-workflow__{name}" for name in sorted(driver_only))]
+
 AGENT_TIMEOUT = 3600
 CACHE_READ_DIVISOR = 10
 
@@ -53,11 +64,7 @@ class DriverError(Exception):
     """The run can't go on without a person: escalation, budget, or a dead agent."""
 
 
-def log(message):
-    print(message, file=sys.stderr, flush=True)
-
-
-def claude_command(prompt, system, model):
+def claude_command(prompt, system, model, role):
     mcp_config = {"mcpServers": {"agent-workflow": {
         "command": sys.executable, "args": ["-m", "agent_workflow.server"],
         "env": {"AGENT_WORKFLOW_HOME": str(mcp.home)},
@@ -71,7 +78,7 @@ def claude_command(prompt, system, model):
             "--strict-mcp-config", "--mcp-config", json.dumps(mcp_config),
             "--settings", json.dumps(SANDBOX),
             "--append-system-prompt", system,
-            "--allowedTools", *ALLOWED_TOOLS, "--disallowedTools", *DENIED_TOOLS]
+            "--allowedTools", *ALLOWED_TOOLS, "--disallowedTools", *denied_tools(role)]
 
 
 def run_agent(run_id, role, task_id, context, workdir, model):
@@ -84,7 +91,7 @@ def run_agent(run_id, role, task_id, context, workdir, model):
               + (PROMPTS / f"{role}.md").read_text())
     prompt = f"You are the {role}. Your context:\n" + json.dumps(context, indent=1)
     try:
-        proc = subprocess.run(claude_command(prompt, system, model), cwd=workdir,
+        proc = subprocess.run(claude_command(prompt, system, model, role), cwd=workdir,
                               capture_output=True, text=True, timeout=AGENT_TIMEOUT)
     except subprocess.TimeoutExpired:
         log(f"  {role} {task_id or ''}: timed out after {AGENT_TIMEOUT}s, usage unknown")
@@ -110,13 +117,37 @@ def model_for(role, task=None):
     return MODELS.get(role, DEFAULT_MODEL)
 
 
-def run_task_role(run_id, task, role):
+def external_choice(task, role, uses):
+    """The provider spec that should do this step, or None for Claude. A cheap coder gets
+    one attempt only: after a failed gate or review, Claude takes over."""
+    if role == "test_writer":
+        return uses.get("test_writer")
+    if role == "coder" and task["risk"] == "low" and task["fix_loops"] == 0:
+        return uses.get("coder_low")
+    return None
+
+
+def run_task_role(run_id, task, role, uses=None):
+    uses = uses or {}
+    spec = external_choice(task, role, uses)
+    if spec:
+        try:
+            if delegate.external_task(run_id, task, role, spec):
+                return
+        except RuntimeError as e:
+            raise DriverError(str(e)) from e
+        log(f"  {role} {task['id']}: {spec} failed, using Claude")
+    extra = {}
+    if role == "reviewer" and task["risk"] == "high" and "second_opinion" in uses:
+        opinion = delegate.second_opinion(run_id, task, uses["second_opinion"])
+        if opinion:
+            extra["second_opinion"] = opinion
     for attempt in (1, 2):
         try:
             claim = mcp.task_claim(run_id=run_id, task_id=task["id"], role=role)
         except Exception as e:
             raise DriverError(str(e)) from e
-        packet = claim["packet"]
+        packet = {**claim["packet"], **extra}
         run_agent(run_id, role, task["id"], packet,
                   packet["worktree"] or mcp.store.run_config(run_id)["repo"], model_for(role, task))
         if not any(t["claimed_by"] for t in mcp.store.list_tasks(run_id) if t["id"] == task["id"]):
@@ -137,22 +168,38 @@ def next_role(task):
             "reviewing": "reviewer", "verifying": "verifier"}.get(task["state"])
 
 
-def drive(run_id, approve=lambda tasks: True):
+def revise_plan(run_id, critique):
+    """One more architect pass, with the critic's findings and the current plan."""
+    brief = mcp.role_brief(run_id=run_id, role="architect")
+    context = {**brief["run"], "revise": True, "critique": critique, "tasks": mcp.store.specs(run_id)}
+    run_agent(run_id, "architect", None, context, mcp.store.run_config(run_id)["repo"],
+              model_for("architect"))
+
+
+def drive(run_id, approve=lambda tasks: True, uses=None):
     """Run (or resume) a run to the end. Returns the scribe's report artifact id or None."""
-    store = mcp.store
+    store, uses = mcp.store, uses or {}
     if not store.repo_map(run_id):
         log("scout")
-        run_role(run_id, "scout")
+        if not ("scout" in uses and delegate.external_scout(run_id, uses["scout"])):
+            run_role(run_id, "scout")
         if not store.repo_map(run_id):
             raise DriverError("the scout stored no repo map")
-    if not store.list_tasks(run_id):
+    planned = not store.list_tasks(run_id)
+    if planned:
         log("architect")
         run_role(run_id, "architect")
-        tasks = store.list_tasks(run_id)
-        if not tasks:
+        if not store.list_tasks(run_id):
             raise DriverError("the architect created no tasks")
-        if len(tasks) > 6 and not approve(tasks):
-            raise DriverError("plan not approved; replan with task_replan, then resume with --run")
+    if "plan_critic" in uses and not any(r["role"] == "critic" for r in store.results(run_id)):
+        log("plan critic")
+        findings = delegate.critique(run_id, uses["plan_critic"])
+        if findings:
+            log("architect (revising)")
+            revise_plan(run_id, findings)
+    tasks = store.list_tasks(run_id)
+    if planned and len(tasks) > 6 and not approve(tasks):
+        raise DriverError("plan not approved; replan with task_replan, then resume with --run")
 
     while True:
         tasks = store.list_tasks(run_id)
@@ -174,11 +221,13 @@ def drive(run_id, approve=lambda tasks: True):
                 outcome = mcp.gate_run(run_id=run_id, task_id=task["id"])
                 log(f"  gate {'passed' if outcome['passed'] else 'failed'}")
             else:
-                run_task_role(run_id, task, role)
+                run_task_role(run_id, task, role, uses)
 
-    for role in ("integrator", "scribe"):
-        log(role)
-        run_role(run_id, role)
+    log("integrator")
+    run_role(run_id, "integrator")
+    log("scribe")
+    if not ("scribe" in uses and delegate.external_scribe(run_id, uses["scribe"])):
+        run_role(run_id, "scribe")
     reports = [a for r in store.results(run_id) if r["role"] == "scribe" for a in r["artifacts"]]
     return reports[-1] if reports else None
 
@@ -197,23 +246,35 @@ def main(argv=None):
     parser.add_argument("--budget", type=int, default=500_000)
     parser.add_argument("--run", help="resume this run id instead of starting one")
     parser.add_argument("--yes", action="store_true", help="don't ask to approve plans over 6 tasks")
+    parser.add_argument("--use", action="append", default=[], metavar="NAME=PROVIDER[:MODEL]",
+                        help="hand a job to copilot or gemini instead of Claude; NAME is one of: "
+                        + "; ".join(f"{n} ({d})" for n, d in delegate.USE_CASES.items()))
     args = parser.parse_args(argv)
     if bool(args.request) == bool(args.run):
         parser.error("give a request or --run, not both")
     if not shutil.which(os.environ.get("AGENT_WORKFLOW_CLAUDE", "claude")):
         parser.error("the claude CLI is not on PATH")
+    try:
+        uses = delegate.parse_uses(args.use)
+    except ValueError as e:
+        parser.error(str(e))
+    for spec in sorted(set(uses.values())):
+        problem = external.check(spec)
+        if problem:
+            parser.error(f"--use {spec}: {problem}")
 
     try:
         run_id = args.run or mcp.workflow_start(
             request=args.request, repo=str(Path(args.repo).resolve()),
             gate_commands=args.gate, budget=args.budget)["run_id"]
         log(f"run {run_id}")
-        report = drive(run_id, (lambda t: True) if args.yes else ask_approval)
+        report = drive(run_id, (lambda t: True) if args.yes else ask_approval, uses)
     except (DriverError, mcp.ToolError) as e:
         log(f"stopped: {e}")
         return 1
     ledger = mcp.store.ledger(run_id)
-    log(f"done: {ledger['spent']} of {ledger['budget']} tokens")
+    log(f"done: {ledger['spent']} of {ledger['budget']} Claude tokens"
+        + "".join(f", {t} {p} tokens" for p, t in ledger["external"].items()))
     if report:
         print(mcp.store.get_artifact(report)["content"])
     return 0

@@ -107,9 +107,45 @@ headless Claude Code process (`claude -p`). It uses your Claude subscription, no
 - Don't put repos or `$AGENT_WORKFLOW_HOME` under `~/.claude`: the sandbox never allows
   writes there.
 
+## Copilot and Gemini as second opinions and cheap workers
+
+The driver can hand some jobs to GitHub Copilot or the Gemini CLI. Both are opt-in with
+`--use NAME=PROVIDER[:MODEL]`, repeatable:
+
+```sh
+.venv/bin/agent-workflow-drive "<request>" --repo /path --gate "pytest -q" \
+  --use second_opinion=gemini --use plan_critic=gemini --use test_writer=copilot \
+  --use coder_low=copilot --use scout=gemini --use scribe=gemini
+```
+
+| `--use` name | What the other CLI does |
+|---|---|
+| `scout` | builds the repo map (read-only) |
+| `scribe` | writes the final report (read-only) |
+| `plan_critic` | critiques the architect's plan, once per run. On findings the architect revises with `task_replan` and `task_create`. |
+| `second_opinion` | reviews the diff of every `risk: high` task. Its findings go to the Claude reviewer as candidates, and the verifier still checks what survives. |
+| `test_writer` | writes the failing tests on `tests_first` tasks |
+| `coder_low` | implements `risk: low` tasks, first attempt only. After a failed gate or review, Claude takes over. |
+
+- **Fallback.** If the other CLI is missing, not signed in, times out or gives an unusable
+  reply, the Claude agent does the job and the run goes on.
+- **Scope guard.** Test writers may only change test files and coders only the files the
+  task owns, plus tests. Anything else they leave behind is discarded. The CLIs never run
+  git: the driver commits what they leave in the worktree.
+- **Sandbox.** They need the network, so each call runs in bubblewrap with the rest hidden:
+  `$HOME` is an empty tmpfs holding only the CLI install and the provider's own login
+  directory, the environment is cleared, the session bus is hidden, and the working
+  directory is read-only except for test writers and coders. A prompt-injected agent could
+  still read that provider's own token.
+- **Ledger.** Their tokens are listed under `external` and never count against the Claude
+  budgets, since they come out of another quota. Copilot also logs its premium requests.
+- **Setup.** `npm install -g --prefix ~/.local @github/copilot @google/gemini-cli`. Copilot
+  uses your `gh` login. For Gemini run `gemini` once and choose Login with Google, or set
+  `GEMINI_API_KEY`. The driver checks both before it starts.
+
 ## Gate sandbox
 
 The gate runs tests, which is code the agents wrote. In both stages it runs inside
-bubblewrap: no network, writes only inside the task's worktree plus a private `/tmp`, and
-secrets dirs hidden. Without `bwrap` (e.g. on macOS) the gate runs unsandboxed and says so
+bubblewrap: no network, writes only inside the task's worktree plus a private `/tmp`,
+secrets dirs hidden, and the session bus (`/run/user`) hidden. Without `bwrap` (e.g. on macOS) the gate runs unsandboxed and says so
 in its result.

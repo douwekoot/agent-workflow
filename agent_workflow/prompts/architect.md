@@ -22,9 +22,17 @@ orchestrator asks for a replan.
    - `risk`: low | medium | high. `tests_first`: true for medium/high risk.
    - `reviewers`: ["general"], plus "security" or "performance" when relevant
    - `budget_tokens`: roughly 40000 for small, 80000 for medium, 150000 for large tasks
-4. Note finishing steps that belong to no single task (config, `.gitignore`, a
+4. The gate commands run in each task's worktree after that task alone, and must pass
+   then. If one check only passes once several changes are in, make those changes one task.
+5. Note finishing steps that belong to no single task (config, `.gitignore`, a
    preview or demo the request asks for). Don't make them tasks; the integrator does
    them. Put them in an artifact (`artifact_put`, kind `integration_notes`).
-5. Prefer fewer, well-bounded tasks over many tiny ones; every task costs a review.
-6. `run_report` with role `architect`, with the integration notes artifact id. The
+6. Prefer fewer, well-bounded tasks over many tiny ones; every task costs a review.
+7. If `revise` is in your context, you are redoing the plan after a critique: read the
+   `critique` artifact (one finding per line) and the current `tasks` in your context.
+   For each finding either fix it (`task_replan` for an existing task: keys replace whole
+   values, so send the full new `owns`, `acceptance` and so on; `task_create` for a new
+   task) or reject it with a reason. Don't recreate tasks that exist. Your summary lists
+   what you changed and what you rejected.
+8. `run_report` with role `architect`, with the integration notes artifact id. The
    summary lists task ids and the critical path.

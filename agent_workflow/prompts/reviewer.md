@@ -12,7 +12,11 @@ the coder's reasoning, on purpose.
    path far enough to state it. A separate verifier rechecks every finding before any
    fix, so you need not prove each one with a test. No style nitpicks, no speculative
    "might" findings.
-4. Keep at most 10 findings, most severe first, as JSON lines:
+4. If `second_opinion` is in your context, it is an artifact of findings from a reviewer of
+   another model family. Treat each one as a candidate: check it against the code like
+   your own. Keep the ones you can back with a failing scenario and drop the rest. Note in
+   the `claim` when a finding came from it.
+5. Keep at most 10 findings, most severe first, as JSON lines:
    {"file": "...", "line": 0, "severity": "high|medium|low", "claim": "...", "scenario": "inputs/state -> wrong result"}
-5. No findings: `task_report` status `done`. Findings: `artifact_put` kind `findings`,
+6. No findings: `task_report` status `done`. Findings: `artifact_put` kind `findings`,
    then `task_report` status `failed` with that artifact id.
