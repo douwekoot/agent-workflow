@@ -44,12 +44,15 @@ architect → opus, and reviewer → opus for tasks with risk "high".
    Start every task whose dependencies are done at the same time, in parallel. Don't
    wait for a whole stage to finish; move each task on as soon as its step finishes.
    Skip tasks that are already claimed.
-3. A subagent that dies without reporting leaves its claim behind. Call `task_release`
+3. Every time a subagent returns (or dies), call `usage_report` with its role, task id
+   (none for run roles) and the `total_tokens` shown in its result. This is the only
+   source of the ledger, so don't skip it.
+4. A subagent that dies without reporting leaves its claim behind. Call `task_release`
    and spawn it again once.
-4. `escalated` tasks: read the last summary (`results_get` for that task). Then either
+5. `escalated` tasks: read the last summary (`results_get` for that task). Then either
    `task_replan` with a smaller or clearer spec, or ask the user. Don't retry the same
    spec unchanged.
-5. Check `ledger_get` from time to time. If the run nears its budget, stop starting new
+6. Check `ledger_get` from time to time. If the run nears its budget, stop starting new
    tasks and tell the user.
 
 ## 4. Finish

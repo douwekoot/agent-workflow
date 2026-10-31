@@ -20,7 +20,9 @@ def spec(task_id, **extra):
 
 def step(store, run, task_id, role, status, tokens=0, artifacts=()):
     store.claim(run, task_id, role)
-    return store.report(run, task_id, role, status, "ok", list(artifacts), tokens)
+    if tokens:
+        store.charge(run, role, tokens, task_id)
+    return store.report(run, task_id, role, status, "ok", list(artifacts))
 
 
 def test_happy_path_with_test_writer(store, run):
@@ -98,15 +100,14 @@ def test_task_budget_refuses_claims(store, run):
     store.create_task(run, spec("T1", budget_tokens=1000))
     result = step(store, run, "T1", "coder", "done", tokens=850)
     assert result["budget"]["warning"] is True
-    store.claim(run, "T1", "gate")
-    store.report(run, "T1", "gate", "failed", "boom", [], 200)
+    step(store, run, "T1", "gate", "failed", tokens=200)
     with pytest.raises(WorkflowError, match="over its token budget"):
         store.claim(run, "T1", "coder")
 
 
 def test_run_budget_refuses_claims(store):
     run = store.start_run("big", budget=1000)
-    store.record_run_result(run, "architect", "done", "planned", [], 1000)
+    store.charge(run, "architect", 1000)
     store.create_task(run, spec("T1"))
     with pytest.raises(WorkflowError, match="run .* is over its token budget"):
         store.claim(run, "T1", "coder")
@@ -114,13 +115,18 @@ def test_run_budget_refuses_claims(store):
 
 def test_ledger(store, run):
     store.create_task(run, spec("T1"))
-    store.record_run_result(run, "scout", "done", "mapped", [], 3000)
+    store.charge(run, "scout", 3000)
     step(store, run, "T1", "coder", "done", tokens=5000)
+    store.charge(run, "coder", 1000, "T1")  # a coder that died without reporting
     ledger = store.ledger(run)
-    assert ledger["spent"] == 8000
-    assert ledger["remaining"] == 92_000
-    assert ledger["by_role"] == {"scout": 3000, "coder": 5000}
-    assert ledger["by_task"] == {"T1": 5000}
+    assert ledger["spent"] == 9000
+    assert ledger["remaining"] == 91_000
+    assert ledger["by_role"] == {"scout": 3000, "coder": 6000}
+    assert ledger["by_task"] == {"T1": 6000}
+    with pytest.raises(WorkflowError, match="unknown task"):
+        store.charge(run, "coder", 10, "T9")
+    with pytest.raises(WorkflowError, match="negative"):
+        store.charge(run, "coder", -1, "T1")
 
 
 def test_result_limits(store, run):

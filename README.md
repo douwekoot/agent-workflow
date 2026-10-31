@@ -15,7 +15,8 @@ spawns subagents. This server holds the shared state and enforces the rules:
 - **Artifacts.** Large output (diffs, logs, findings) is stored on disk and passed around by
   id. `artifact_get` reads it in slices.
 - **Result caps.** A summary can be at most 400 characters. Detail goes in an artifact.
-- **Token ledger.** There is a budget per task and per run. Packets carry a warning at 80%,
+- **Token ledger.** There is a budget per task and per run. The orchestrator books each
+  subagent's measured usage with `usage_report`; agents can't see their own usage. Packets carry a warning at 80%,
   and claims are refused once a budget is used up.
 - **Gate and worktrees.** Each task gets its own git worktree and branch. `gate_run` runs
   your build, lint and test commands there and keeps only the tail of the failing log.
@@ -67,7 +68,8 @@ integrator; opus for the architect and for reviewing high-risk tasks.
 | `role_brief` | scout, architect, integrator, scribe (instructions + run context) |
 | `gate_run` | orchestrator (runs the checks; no LLM) |
 | `task_merge` | integrator |
-| `run_report` | run-level roles (scout, architect, verifier, integrator, scribe) to log usage |
+| `run_report` | run-level roles (scout, architect, integrator, scribe) to finish |
+| `usage_report` | orchestrator: books each subagent's measured token use in the ledger |
 | `artifact_put`, `artifact_get` | everyone |
 
 Prompt: `orchestrate(request)` is the orchestrator's playbook.

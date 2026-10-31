@@ -25,12 +25,13 @@ playbook for the orchestrator. Protocol:
 1. workflow_start once per big request; small requests should skip the workflow.
    Run-level subagents (scout, architect, integrator, scribe) start with role_brief.
 2. A scout stores its repo map with repo_map_put; an architect adds tasks with task_create
-   in dependency order. Run-level roles log their usage with run_report.
+   in dependency order. Run-level roles finish with run_report.
 3. For each task: task_claim(role) returns the context packet the subagent needs — give the
    subagent only that packet, not the conversation. The subagent works, stores large output
    with artifact_put, and the result goes back with task_report (summary <= 400 chars).
    Order per task: [test_writer] -> coder -> gate_run -> reviewer -> done; gate or review
    failures send it back to the coder until the fix-loop cap, then it is escalated.
+   After every subagent, the orchestrator books its real token use with usage_report.
 4. Escalated tasks need task_replan or a decision from the user.
 5. When all tasks are done: task_merge each, then the integrator and scribe finish up.
 Pass artifact ids between agents, never artifact contents.
@@ -149,10 +150,10 @@ def results_get(run_id: str, task_id: str | None = None) -> dict:
 
 @tool
 def task_report(run_id: str, task_id: str, role: str, status: str, summary: str,
-                artifacts: list[str] | None = None, tokens_used: int = 0) -> dict:
+                artifacts: list[str] | None = None) -> dict:
     """Report a claimed task's result. status: done, failed or escalate. For a reviewer,
     done = no confirmed findings, failed = confirmed findings (stored as an artifact)."""
-    return store.report(run_id, task_id, role, status, summary, artifacts or [], tokens_used)
+    return store.report(run_id, task_id, role, status, summary, artifacts or [])
 
 
 @tool
@@ -199,9 +200,17 @@ def task_merge(run_id: str, task_id: str) -> dict:
 
 @tool
 def run_report(run_id: str, role: str, status: str, summary: str,
-               artifacts: list[str] | None = None, tokens_used: int = 0) -> dict:
+               artifacts: list[str] | None = None) -> dict:
     """Log work not tied to one task (scout, architect, verifier, integrator, scribe)."""
-    store.record_run_result(run_id, role, status, summary, artifacts or [], tokens_used)
+    store.record_run_result(run_id, role, status, summary, artifacts or [])
+    return {"recorded": role}
+
+
+@tool
+def usage_report(run_id: str, role: str, tokens: int, task_id: str | None = None) -> dict:
+    """Orchestrator: book the tokens a subagent used (the total_tokens its result shows),
+    after every subagent, including ones that died without reporting."""
+    store.charge(run_id, role, tokens, task_id)
     return store.ledger(run_id)
 
 

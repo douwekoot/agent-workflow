@@ -13,7 +13,7 @@ Several agents work in parallel. Each owns a narrow job. Tokens are budgeted.
   fetching everything.
 - Finish with exactly one report call (`task_report` for task roles, `run_report` for
   run roles). The summary is at most 400 characters: what you did and anything the next
-  step must know. Include an honest estimate of your tokens used.
+  step must know. Your token use is measured for you; don't report it.
 - Use status `escalate` when the task is impossible as specified, needs files you do not
   own, or needs a decision from a human. Say why in the summary.
 - After reporting, reply to whoever spawned you with only that summary.

@@ -42,6 +42,14 @@ CREATE TABLE IF NOT EXISTS results (
     tokens INTEGER NOT NULL,
     created REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS usage (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    task_id TEXT,
+    role TEXT NOT NULL,
+    tokens INTEGER NOT NULL,
+    created REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS artifacts (
     id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL,
@@ -231,7 +239,7 @@ class Store:
             "budget": budget,
         }
 
-    def report(self, run_id, task_id, role, status, summary, artifacts=(), tokens_used=0):
+    def report(self, run_id, task_id, role, status, summary, artifacts=()):
         """Record a claimed role's result, charge the ledger and advance the task.
 
         Status meanings per role: test_writer/coder "done" = work finished; gate "done" =
@@ -241,8 +249,8 @@ class Store:
         task = self._task(run_id, task_id)
         if task["claimed_by"] != role:
             raise WorkflowError(f"task {task_id} is not claimed by {role}")
-        self._check_result(status, summary, artifacts, tokens_used)
-        self._record(run_id, task_id, role, status, summary, artifacts, tokens_used)
+        self._check_result(status, summary, artifacts)
+        self._record(run_id, task_id, role, status, summary, artifacts)
 
         next_state = "escalated" if status == "escalate" else NEXT_STATE.get((role, status), "escalated")
         fix_loops = task["fix_loops"]
@@ -267,35 +275,33 @@ class Store:
                 "UPDATE tasks SET claimed_by = NULL WHERE run_id = ? AND id = ?", (run_id, task_id)
             )
 
-    def record_run_result(self, run_id, role, status, summary, artifacts=(), tokens_used=0):
-        """Charge work not tied to one task (scout, architect, integrator, scribe)."""
+    def record_run_result(self, run_id, role, status, summary, artifacts=()):
+        """Record work not tied to one task (scout, architect, integrator, scribe)."""
         self._run(run_id)
-        self._check_result(status, summary, artifacts, tokens_used)
+        self._check_result(status, summary, artifacts)
         if role in TASK_ROLES:
             raise WorkflowError(f"role {role} works on tasks; use claim and report")
-        self._record(run_id, None, role, status, summary, artifacts, tokens_used)
+        self._record(run_id, None, role, status, summary, artifacts)
 
-    def _check_result(self, status, summary, artifacts, tokens_used):
+    def _check_result(self, status, summary, artifacts):
         if status not in STATUSES:
             raise WorkflowError(f"status must be one of {sorted(STATUSES)}")
         if len(summary) > MAX_SUMMARY_CHARS:
             raise WorkflowError(
                 f"summary is {len(summary)} chars, max {MAX_SUMMARY_CHARS}; put detail in an artifact"
             )
-        if tokens_used < 0:
-            raise WorkflowError("tokens_used cannot be negative")
         for artifact_id in artifacts:
             if self.db.execute("SELECT 1 FROM artifacts WHERE id = ?", (artifact_id,)).fetchone() is None:
                 raise WorkflowError(f"unknown artifact {artifact_id}")
 
-    def _record(self, run_id, task_id, role, status, summary, artifacts, tokens_used):
+    def _record(self, run_id, task_id, role, status, summary, artifacts):
         if role not in ROLES:
             raise WorkflowError(f"unknown role {role}")
         with self.db:
             self.db.execute(
                 "INSERT INTO results (run_id, task_id, role, status, summary, artifacts, tokens, created) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (run_id, task_id, role, status, summary, json.dumps(list(artifacts)), tokens_used, time.time()),
+                (run_id, task_id, role, status, summary, json.dumps(list(artifacts)), 0, time.time()),
             )
 
     def _latest_artifacts(self, run_id, task_id):
@@ -316,14 +322,34 @@ class Store:
             args.append(task_id)
         return [
             {"task_id": r["task_id"], "role": r["role"], "status": r["status"], "summary": r["summary"],
-             "artifacts": json.loads(r["artifacts"]), "tokens_used": r["tokens"]}
+             "artifacts": json.loads(r["artifacts"])}
             for r in self.db.execute(query + " ORDER BY seq", args)
         ]
 
     # --- ledger -----------------------------------------------------------------------
 
+    def charge(self, run_id, role, tokens, task_id=None):
+        """Book tokens a subagent actually used, as measured by whoever ran it. Agents can't
+        see their own usage, so self-estimates were dropped: they were mostly 0."""
+        self._run(run_id)
+        if role not in ROLES:
+            raise WorkflowError(f"unknown role {role}")
+        if tokens < 0:
+            raise WorkflowError("tokens cannot be negative")
+        if task_id:
+            self._task(run_id, task_id)
+        with self.db:
+            self.db.execute(
+                "INSERT INTO usage (run_id, task_id, role, tokens, created) VALUES (?, ?, ?, ?, ?)",
+                (run_id, task_id, role, tokens, time.time()),
+            )
+
+    # Old runs booked self-estimates on results.tokens; new results store 0 there.
+    SPEND = ("SELECT run_id, task_id, role, tokens FROM usage UNION ALL "
+             "SELECT run_id, task_id, role, tokens FROM results")
+
     def _spent(self, run_id, task_id=None):
-        query, args = "SELECT COALESCE(SUM(tokens), 0) FROM results WHERE run_id = ?", [run_id]
+        query, args = f"SELECT COALESCE(SUM(tokens), 0) FROM ({self.SPEND}) WHERE run_id = ?", [run_id]
         if task_id:
             query += " AND task_id = ?"
             args.append(task_id)
@@ -345,9 +371,10 @@ class Store:
     def ledger(self, run_id):
         run = self._run(run_id)
         by_role = {r[0]: r[1] for r in self.db.execute(
-            "SELECT role, SUM(tokens) FROM results WHERE run_id = ? GROUP BY role", (run_id,))}
+            f"SELECT role, SUM(tokens) FROM ({self.SPEND}) WHERE run_id = ? GROUP BY role "
+            "HAVING SUM(tokens) > 0", (run_id,))}
         by_task = {r[0]: r[1] for r in self.db.execute(
-            "SELECT task_id, SUM(tokens) FROM results WHERE run_id = ? AND task_id IS NOT NULL "
+            f"SELECT task_id, SUM(tokens) FROM ({self.SPEND}) WHERE run_id = ? AND task_id IS NOT NULL "
             "GROUP BY task_id", (run_id,))}
         spent = self._spent(run_id)
         return {"budget": run["budget"], "spent": spent, "remaining": run["budget"] - spent,

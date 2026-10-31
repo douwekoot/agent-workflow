@@ -74,7 +74,8 @@ def test_full_task_through_mcp(server, repo):
     worktree = Path(claim["packet"]["worktree"])
     commit_value(worktree, "still broken")
     call(server, "task_report", run_id=run, task_id="T1", role="coder", status="done",
-         summary="tried", tokens_used=1000)
+         summary="tried")
+    call(server, "usage_report", run_id=run, role="coder", task_id="T1", tokens=1000)
     gate = call(server, "gate_run", run_id=run, task_id="T1")
     assert gate["passed"] is False and gate["state"] == "fixing"
     log = call(server, "artifact_get", artifact_id=gate["artifacts"][0])
@@ -84,16 +85,18 @@ def test_full_task_through_mcp(server, repo):
     assert packet["inputs"]["artifacts"] == gate["artifacts"]
     commit_value(worktree, "fixed")
     call(server, "task_report", run_id=run, task_id="T1", role="coder", status="done",
-         summary="fixed", tokens_used=500)
+         summary="fixed")
+    call(server, "usage_report", run_id=run, role="coder", task_id="T1", tokens=500)
     assert call(server, "gate_run", run_id=run, task_id="T1")["state"] == "reviewing"
 
     call(server, "task_claim", run_id=run, task_id="T1", role="reviewer")
     assert call(server, "task_report", run_id=run, task_id="T1", role="reviewer", status="done",
-                summary="clean", tokens_used=800)["state"] == "done"
+                summary="clean")["state"] == "done"
+    call(server, "usage_report", run_id=run, role="reviewer", task_id="T1", tokens=800)
 
     assert call(server, "task_merge", run_id=run, task_id="T1")["merged"] is True
     assert (repo / "value.txt").read_text() == "fixed\n"
-    assert call(server, "ledger_get", run_id=run)["by_role"] == {"coder": 1500, "gate": 0, "reviewer": 800}
+    assert call(server, "ledger_get", run_id=run)["by_role"] == {"coder": 1500, "reviewer": 800}
     roles = [r["role"] for r in call(server, "results_get", run_id=run, task_id="T1")["results"]]
     assert roles == ["coder", "gate", "coder", "gate", "reviewer"]
 
