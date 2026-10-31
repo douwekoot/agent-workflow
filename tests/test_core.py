@@ -86,8 +86,11 @@ def test_escalate_and_replan(store, run):
         store.replan(run, "T1", {"owns_add": ["x.py"]})
     with pytest.raises(WorkflowError, match="missing owns"):
         store.replan(run, "T1", {"owns": []})
-    with pytest.raises(WorkflowError, match="itself"):
+    with pytest.raises(WorkflowError, match="cycle"):
         store.replan(run, "T1", {"depends_on": ["T1"]})
+    store.create_task(run, spec("T2", depends_on=["T1"]))
+    with pytest.raises(WorkflowError, match="cycle"):
+        store.replan(run, "T1", {"depends_on": ["T2"]})
 
 
 def test_replan_keeps_progress_of_running_task(store, run):
@@ -132,7 +135,8 @@ def test_task_budget_refuses_claims(store, run):
     store.create_task(run, spec("T1", budget_tokens=1000))
     result = step(store, run, "T1", "coder", "done", tokens=850)
     assert result["budget"]["warning"] is True
-    step(store, run, "T1", "gate", "failed", tokens=200)
+    store.charge(run, "coder", 200, "T1")
+    step(store, run, "T1", "gate", "failed")  # over budget, but the gate still runs
     with pytest.raises(WorkflowError, match="over its token budget"):
         store.claim(run, "T1", "coder")
 

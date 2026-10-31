@@ -214,9 +214,18 @@ class Store:
         if missing:
             raise WorkflowError(f"task spec missing {', '.join(missing)}")
         for dep in spec["depends_on"]:
-            if dep == task_id:
-                raise WorkflowError(f"task {task_id} cannot depend on itself")
             self._task(run_id, dep)
+        # Unlike create, replan can point at later tasks, so it can close a cycle.
+        deps = {t["id"]: t["depends_on"] for t in self.list_tasks(run_id)}
+        deps[task_id] = spec["depends_on"]
+        stack, seen = list(spec["depends_on"]), set()
+        while stack:
+            dep = stack.pop()
+            if dep == task_id:
+                raise WorkflowError(f"task {task_id} would be in a dependency cycle")
+            if dep not in seen:
+                seen.add(dep)
+                stack.extend(deps[dep])
         restart = task["state"] == "escalated"
         with self.db:
             self.db.execute(
@@ -241,7 +250,9 @@ class Store:
                 raise WorkflowError(f"task {task_id} is waiting on {dep}")
 
         budget = self._budget_status(run_id, task_id, spec)
-        if budget["task_remaining"] <= 0:
+        if role == "gate":
+            pass  # the gate spends no tokens, so finished code still gets checked
+        elif budget["task_remaining"] <= 0:
             raise WorkflowError(f"task {task_id} is over its token budget; escalate or replan")
         if budget["run_remaining"] <= 0:
             raise WorkflowError(f"run {run_id} is over its token budget")

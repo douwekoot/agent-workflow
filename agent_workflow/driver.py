@@ -1,45 +1,52 @@
-"""Stage 2: a driver that runs a whole workflow itself through the Anthropic API.
+"""Stage 2: a driver that runs a whole workflow on its own, with headless Claude Code.
 
-It walks the same state machine as a Claude Code orchestrator, using the same MCP tools
-in-process, but makes every model call itself. That buys two things the host can't give:
-an exact token ledger (every response's usage is booked) and a fixed prompt prefix, so
-the parts agents share are cache reads.
+It walks the same state machine as a Claude Code orchestrator, but each subagent is a
+`claude -p` process, so it runs on your Claude subscription, not the API. That buys two
+things the interactive host can't give:
 
-Prefix per agent, in render order, with a cache breakpoint after each stable part:
-  tools (identical for every agent) + common.md + repo map  -> shared by the whole run
-  role instructions                                         -> shared by every agent in a role
-  packet + conversation (automatic caching moves along the tail)
+- An exact ledger: each agent's reported usage is booked.
+- A fixed prompt prefix: common rules + repo map + role instructions go in the appended
+  system prompt, so agents of the same role reuse Claude Code's prompt cache.
+
+Every agent runs in Claude Code's bash sandbox: writes only inside its working directory
+(the task worktree), no network, no unsandboxed fallback, and secrets dirs unreadable.
+File tools are confined to the working directory and web tools and subagents are off.
 
 Run:  agent-workflow-drive "<request>" --repo PATH --gate "pytest -q" [--gate ...]
       agent-workflow-drive --run RUN_ID      (resume, e.g. after replanning an escalation)
-
-Security: bash commands come from the model and run unsandboxed as you, in the task's
-worktree. Run the driver inside a container or VM for repos you don't fully trust.
 """
 
 import argparse
-import asyncio
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-import anthropic
-
 from . import server as mcp
 from .server import PROMPTS
 
-MODELS = {"scout": "claude-haiku-5-5", "scribe": "claude-haiku-5-5", "architect": "claude-opus-5-5"}
-DEFAULT_MODEL = "claude-sonnet-5-5"
-HIGH_RISK_MODEL = "claude-opus-5-5"  # reviewer and verifier on risk "high" tasks
-# Opus 5.5 defaults to medium effort; planning and high-risk review deserve more.
-EFFORT = {"claude-opus-5-5": "high"}
+MODELS = {"scout": "haiku", "scribe": "haiku", "architect": "opus"}
+DEFAULT_MODEL = "sonnet"
+HIGH_RISK_MODEL = "opus"  # reviewer and verifier on risk "high" tasks
 # Claims, gates, replans and usage are the driver's job, as they are the orchestrator's.
 DRIVER_ONLY = {"workflow_start", "usage_report", "gate_run", "task_claim", "role_brief",
                "task_release", "task_replan"}
-EDITOR = "str_replace_based_edit_tool"
-MAX_TURNS = 150
-MAX_OUTPUT_CHARS = 30_000
+SECRETS = ["~/.ssh", "~/.aws", "~/.gnupg"]
+SANDBOX = {"sandbox": {
+    "enabled": True,
+    "failIfUnavailable": True,          # never fall back to running bash unsandboxed
+    "allowUnsandboxedCommands": False,  # and ignore the model's requests to escape it
+    "autoAllowBashIfSandboxed": True,
+    "filesystem": {"denyRead": SECRETS},
+}}
+ALLOWED_TOOLS = ["Bash", "Read", "Glob", "Grep", "Edit(/**)", "Write(/**)", "mcp__agent-workflow"]
+DENIED_TOOLS = ["Agent", "WebFetch", "WebSearch",
+                *(f"Read({d}/**)" for d in SECRETS),
+                *(f"mcp__agent-workflow__{name}" for name in sorted(DRIVER_ONLY))]
+AGENT_TIMEOUT = 3600
+CACHE_READ_DIVISOR = 10
 
 
 class DriverError(Exception):
@@ -50,132 +57,51 @@ def log(message):
     print(message, file=sys.stderr, flush=True)
 
 
-def tool_definitions():
-    """The agent's tools, sorted so the cached prefix is byte-identical across agents."""
-    workflow = [
-        {"name": t.name, "description": t.description, "input_schema": t.input_schema}
-        for t in asyncio.run(mcp.server.list_tools()) if t.name not in DRIVER_ONLY
-    ]
-    return [{"type": "bash_20250124", "name": "bash"},
-            {"type": "text_editor_20250728", "name": EDITOR},
-            *sorted(workflow, key=lambda t: t["name"])]
+def claude_command(prompt, system, model):
+    mcp_config = {"mcpServers": {"agent-workflow": {
+        "command": sys.executable, "args": ["-m", "agent_workflow.server"],
+        "env": {"AGENT_WORKFLOW_HOME": str(mcp.home)},
+    }}}
+    return [os.environ.get("AGENT_WORKFLOW_CLAUDE", "claude"), "-p", prompt,
+            "--model", model, "--output-format", "json",
+            # dontAsk refuses anything not allowed below instead of waiting for a prompt.
+            "--permission-mode", "dontAsk", "--no-session-persistence",
+            # No user settings, hooks or plugins: every agent gets the same prefix.
+            "--setting-sources", "",
+            "--strict-mcp-config", "--mcp-config", json.dumps(mcp_config),
+            "--settings", json.dumps(SANDBOX),
+            "--append-system-prompt", system,
+            "--allowedTools", *ALLOWED_TOOLS, "--disallowedTools", *DENIED_TOOLS]
 
 
-def run_bash(cwd, command, timeout=600):
-    # shortcut: every command gets a fresh shell, so cd and exports don't carry over;
-    # switch to a persistent session if agents keep tripping on it.
-    try:
-        proc = subprocess.run(["bash", "-c", command], cwd=cwd, capture_output=True,
-                              text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return f"timed out after {timeout}s", True
-    output = proc.stdout + proc.stderr
-    if len(output) > MAX_OUTPUT_CHARS:
-        output = "[... earlier output cut ...]\n" + output[-MAX_OUTPUT_CHARS:]
-    return f"{output}\n(exit code {proc.returncode})", False
-
-
-def edit_file(root, args):
-    """The text editor tool, confined to root: model-supplied paths are untrusted."""
-    root = Path(root).resolve()
-    path = (root / args["path"]).resolve()
-    if not path.is_relative_to(root):
-        raise ValueError(f"{args['path']} is outside {root}")
-    command = args["command"]
-    if command == "view":
-        if path.is_dir():
-            return "\n".join(sorted(p.name + "/" * p.is_dir() for p in path.iterdir()))
-        lines = path.read_text().splitlines()
-        start, end = args.get("view_range") or (1, len(lines))
-        end = len(lines) if end == -1 else end
-        return "\n".join(f"{n}\t{line}" for n, line in enumerate(lines[start - 1:end], start))
-    if command == "create":
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(args["file_text"])
-        return f"wrote {path}"
-    if command == "str_replace":
-        text = path.read_text()
-        count = text.count(args["old_str"])
-        if count != 1:
-            raise ValueError(f"old_str occurs {count} times in {path}; it must occur exactly once")
-        path.write_text(text.replace(args["old_str"], args.get("new_str", "")))
-        return f"edited {path}"
-    if command == "insert":
-        text = args["insert_text"]
-        lines = path.read_text().splitlines(keepends=True)
-        lines.insert(args["insert_line"], text if text.endswith("\n") else text + "\n")
-        path.write_text("".join(lines))
-        return f"edited {path}"
-    raise ValueError(f"unknown editor command {command}")
-
-
-def call_tool(name, args, workdir):
-    """Run one tool call; returns (text, is_error) so failures go back to the model."""
-    try:
-        if name == "bash":
-            if args.get("restart"):
-                return "shell restarted", False
-            return run_bash(workdir, args["command"])
-        if name == EDITOR:
-            return edit_file(workdir, args), False
-        if name in DRIVER_ONLY:
-            raise ValueError(f"{name} is not available to agents")
-        result = asyncio.run(mcp.server.call_tool(name, args))
-        text = "\n".join(c.text for c in result.content if c.type == "text")
-        return text, bool(result.is_error)
-    except Exception as e:  # the model sees the error and can recover
-        return f"{type(e).__name__}: {e}", True
-
-
-def run_agent(client, run_id, role, task_id, context, workdir, model):
-    """One subagent: a manual tool loop until the model stops calling tools."""
+def run_agent(run_id, role, task_id, context, workdir, model):
+    """One subagent: a sandboxed `claude -p` run; its usage is booked in the ledger."""
     store = mcp.store
     map_id = store.repo_map(run_id)
     repo_map = store.get_artifact(map_id)["content"] if map_id else "(no repo map yet)"
-    system = [
-        {"type": "text", "cache_control": {"type": "ephemeral"},
-         "text": (PROMPTS / "common.md").read_text()
-                 + f"\n# Repo map (artifact {map_id}; it is here already, don't fetch it)\n\n"
-                 + repo_map},
-        {"type": "text", "cache_control": {"type": "ephemeral"},
-         "text": (PROMPTS / f"{role}.md").read_text()},
-    ]
-    messages = [{"role": "user", "content": f"You are the {role}. Your context:\n"
-                                            + json.dumps(context, indent=1)}]
-    extra = {}
-    if model != "claude-haiku-5-5":  # Haiku has no server-side fallback
-        extra = {"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"}
-    if model in EFFORT:
-        extra["output_config"] = {"effort": EFFORT[model]}
-    tools = tool_definitions()
-    spent = cached = 0
-    stop = "turn limit"
-    for _ in range(MAX_TURNS):
-        # Streaming because max_tokens is large. Custom tools leave eager input streaming
-        # off: a truncated artifact_put would be stored without any error.
-        with client.beta.messages.stream(model=model, max_tokens=64_000, system=system,
-                                         tools=tools, messages=messages,
-                                         cache_control={"type": "ephemeral"}, **extra) as stream:
-            response = stream.get_final_message()
-        usage = response.usage
-        tokens = (usage.input_tokens + usage.output_tokens
-                  + (usage.cache_creation_input_tokens or 0) + (usage.cache_read_input_tokens or 0))
-        store.charge(run_id, role, tokens, task_id)
-        spent += tokens
-        cached += usage.cache_read_input_tokens or 0
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
-            stop = response.stop_reason
-            break
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                text, is_error = call_tool(block.name, block.input, workdir)
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": text, "is_error": is_error})
-        messages.append({"role": "user", "content": results})
-    log(f"  {role} {task_id or ''}: {spent} tokens, {cached * 100 // max(spent, 1)}% cache reads"
-        + (f", stopped: {stop}" if stop != "end_turn" else ""))
+    system = ((PROMPTS / "common.md").read_text()
+              + f"\n# Repo map (artifact {map_id}; it is here already, don't fetch it)\n\n{repo_map}\n\n"
+              + (PROMPTS / f"{role}.md").read_text())
+    prompt = f"You are the {role}. Your context:\n" + json.dumps(context, indent=1)
+    try:
+        proc = subprocess.run(claude_command(prompt, system, model), cwd=workdir,
+                              capture_output=True, text=True, timeout=AGENT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        log(f"  {role} {task_id or ''}: timed out after {AGENT_TIMEOUT}s, usage unknown")
+        return
+    try:
+        result = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        raise DriverError(f"claude failed for {role} (exit {proc.returncode}): "
+                          f"{(proc.stderr or proc.stdout)[-500:]}") from None
+    usage = result.get("usage") or {}
+    cached = usage.get("cache_read_input_tokens") or 0
+    fresh = sum(usage.get(k) or 0 for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens"))
+    # Claude Code rereads its ~20k-token base prompt from cache every turn. Cache reads cost
+    # a tenth of fresh input, so they count a tenth; at full weight they swamp the budgets.
+    store.charge(run_id, role, fresh + cached // CACHE_READ_DIVISOR, task_id)
+    log(f"  {role} {task_id or ''}: {fresh} fresh + {cached} cache-read tokens"
+        + (f", error: {result.get('subtype')}" if result.get("is_error") else ""))
 
 
 def model_for(role, task=None):
@@ -184,14 +110,14 @@ def model_for(role, task=None):
     return MODELS.get(role, DEFAULT_MODEL)
 
 
-def run_task_role(client, run_id, task, role):
+def run_task_role(run_id, task, role):
     for attempt in (1, 2):
         try:
             claim = mcp.task_claim(run_id=run_id, task_id=task["id"], role=role)
         except Exception as e:
             raise DriverError(str(e)) from e
         packet = claim["packet"]
-        run_agent(client, run_id, role, task["id"], packet,
+        run_agent(run_id, role, task["id"], packet,
                   packet["worktree"] or mcp.store.run_config(run_id)["repo"], model_for(role, task))
         if not any(t["claimed_by"] for t in mcp.store.list_tasks(run_id) if t["id"] == task["id"]):
             return
@@ -200,10 +126,9 @@ def run_task_role(client, run_id, task, role):
     raise DriverError(f"{role} for {task['id']} twice ended without reporting")
 
 
-def run_role(client, run_id, role):
+def run_role(run_id, role):
     brief = mcp.role_brief(run_id=run_id, role=role)
-    run_agent(client, run_id, role, None, brief["run"], mcp.store.run_config(run_id)["repo"],
-              model_for(role))
+    run_agent(run_id, role, None, brief["run"], mcp.store.run_config(run_id)["repo"], model_for(role))
 
 
 def next_role(task):
@@ -212,17 +137,17 @@ def next_role(task):
             "reviewing": "reviewer", "verifying": "verifier"}.get(task["state"])
 
 
-def drive(client, run_id, approve=lambda tasks: True):
+def drive(run_id, approve=lambda tasks: True):
     """Run (or resume) a run to the end. Returns the scribe's report artifact id or None."""
     store = mcp.store
     if not store.repo_map(run_id):
         log("scout")
-        run_role(client, run_id, "scout")
+        run_role(run_id, "scout")
         if not store.repo_map(run_id):
             raise DriverError("the scout stored no repo map")
     if not store.list_tasks(run_id):
         log("architect")
-        run_role(client, run_id, "architect")
+        run_role(run_id, "architect")
         tasks = store.list_tasks(run_id)
         if not tasks:
             raise DriverError("the architect created no tasks")
@@ -234,8 +159,8 @@ def drive(client, run_id, approve=lambda tasks: True):
         state = {t["id"]: t["state"] for t in tasks}
         if all(s == "done" for s in state.values()):
             break
-        # shortcut: tasks run one step at a time, not in parallel; add a thread pool
-        # (one store lock already makes the tools safe) if runs get slow.
+        # shortcut: tasks run one step at a time, not in parallel; run agents in threads
+        # (the tools are already safe for that) if runs get slow.
         ready = [t for t in tasks if next_role(t) and not t["claimed_by"]
                  and all(state[d] == "done" for d in t["depends_on"])]
         if not ready:
@@ -249,11 +174,11 @@ def drive(client, run_id, approve=lambda tasks: True):
                 outcome = mcp.gate_run(run_id=run_id, task_id=task["id"])
                 log(f"  gate {'passed' if outcome['passed'] else 'failed'}")
             else:
-                run_task_role(client, run_id, task, role)
+                run_task_role(run_id, task, role)
 
     for role in ("integrator", "scribe"):
         log(role)
-        run_role(client, run_id, role)
+        run_role(run_id, role)
     reports = [a for r in store.results(run_id) if r["role"] == "scribe" for a in r["artifacts"]]
     return reports[-1] if reports else None
 
@@ -275,13 +200,15 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if bool(args.request) == bool(args.run):
         parser.error("give a request or --run, not both")
+    if not shutil.which(os.environ.get("AGENT_WORKFLOW_CLAUDE", "claude")):
+        parser.error("the claude CLI is not on PATH")
 
     try:
         run_id = args.run or mcp.workflow_start(
             request=args.request, repo=str(Path(args.repo).resolve()),
             gate_commands=args.gate, budget=args.budget)["run_id"]
         log(f"run {run_id}")
-        report = drive(anthropic.Anthropic(), run_id, (lambda t: True) if args.yes else ask_approval)
+        report = drive(run_id, (lambda t: True) if args.yes else ask_approval)
     except (DriverError, mcp.ToolError) as e:
         log(f"stopped: {e}")
         return 1

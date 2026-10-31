@@ -175,8 +175,9 @@ def task_replan(run_id: str, task_id: str, spec: dict) -> dict:
 
 @tool
 def gate_run(run_id: str, task_id: str) -> dict:
-    """Run the gate commands in a coded task's worktree. Passes go to review; failures go
-    back to the coder with only the tail of the failing log."""
+    """Run the gate commands in a coded task's worktree, sandboxed with bubblewrap (no
+    network, writes only in the worktree). Passes go to review; failures go back to the
+    coder with only the tail of the failing log."""
     config = store.run_config(run_id)
     store.claim(run_id, task_id, "gate")
     try:
@@ -188,9 +189,12 @@ def gate_run(run_id: str, task_id: str) -> dict:
     if not outcome["passed"]:
         artifacts.append(store.put_artifact(run_id, "gate_log", outcome["log"], task_id))
     summary = "all checks passed" if outcome["passed"] else f"failed: {outcome['failed_command']}"
+    if not outcome["sandboxed"]:
+        summary += " (unsandboxed: bwrap not installed)"
     result = store.report(run_id, task_id, "gate", "done" if outcome["passed"] else "failed",
                           summary[:400], artifacts)
-    return {**result, "passed": outcome["passed"], "artifacts": artifacts}
+    return {**result, "passed": outcome["passed"], "sandboxed": outcome["sandboxed"],
+            "artifacts": artifacts}
 
 
 @tool

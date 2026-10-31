@@ -77,29 +77,39 @@ Prompt: `orchestrate(request)` is the orchestrator's playbook.
 
 ## Stage 2: the driver
 
-`agent-workflow-drive` runs a whole workflow without Claude Code. It walks the same state
-machine and calls the same tools in-process, but makes every model call itself through the
-Anthropic API:
+`agent-workflow-drive` runs a whole workflow without an interactive session. It walks the
+same state machine and calls the same tools in-process, and runs each subagent as a
+headless Claude Code process (`claude -p`). It uses your Claude subscription, not the API:
 
 ```sh
-.venv/bin/pip install -e ".[driver]"
 .venv/bin/agent-workflow-drive "<request>" --repo /path/to/repo --gate "pytest -q"
 .venv/bin/agent-workflow-drive --run <run_id>   # resume, e.g. after a task_replan
 ```
 
-- **Exact ledger.** Every response's usage is booked, so budgets hold.
-- **Prompt caching.** Each agent's prefix is tools, then `common.md` plus the repo map
-  (shared by the whole run), then the role's instructions (shared within a role), with a
-  cache breakpoint after each. The conversation tail uses automatic caching. Each agent
-  logs its cache-read share.
-- **Models.** Haiku 5.5 for scout and scribe, Opus 5.5 for the architect and for reviewing
-  or verifying high-risk tasks, Sonnet 5.5 for the rest. Opus and Sonnet requests turn on
-  the API's server-side refusal fallback.
+- **Exact ledger.** Each agent's reported usage is booked, so budgets hold. Cache reads
+  count a tenth, as they cost: Claude Code rereads a ~20k-token base prompt every turn.
+- **Prompt caching.** Common rules, the repo map and the role's instructions go into the
+  appended system prompt. Agents in the same role then share Claude Code's prompt cache.
+  Each agent logs its cache-read share.
+- **Models.** Haiku for scout and scribe, Opus for the architect and for reviewing or
+  verifying high-risk tasks, Sonnet for the rest.
+- **Sandboxed agents.** Every agent's bash runs in Claude Code's sandbox (bubblewrap), with
+  no unsandboxed fallback:
+  - writes only inside its working directory (the task's worktree)
+  - no network
+  - `~/.ssh`, `~/.aws` and `~/.gnupg` can't be read
+  
+  File edits are limited to the working directory. Web tools and nested subagents are off.
+  User settings, hooks and plugins are not loaded.
 - It stops and tells you when a task escalates, the budget runs out, or a plan has more
   than 6 tasks (unless `--yes`). Fix it with the MCP tools, then resume with `--run`.
 - Tasks run one step at a time, not in parallel.
-- **Security:** agents' bash commands run unsandboxed as you, in the task's worktree. The
-  file editor is confined to that worktree. Run the driver in a container or VM for repos
-  you don't fully trust.
+- Don't put repos or `$AGENT_WORKFLOW_HOME` under `~/.claude`: the sandbox never allows
+  writes there.
 
-Needs Anthropic credentials (`ANTHROPIC_API_KEY` or `ant auth login`).
+## Gate sandbox
+
+The gate runs tests, which is code the agents wrote. In both stages it runs inside
+bubblewrap: no network, writes only inside the task's worktree plus a private `/tmp`, and
+secrets dirs hidden. Without `bwrap` (e.g. on macOS) the gate runs unsandboxed and says so
+in its result.

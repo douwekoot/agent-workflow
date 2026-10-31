@@ -1,46 +1,12 @@
-"""The Stage 2 driver against a scripted fake API client and a real git repo."""
+"""The Stage 2 driver with a fake `claude` binary and a real git repo."""
 
-import contextlib
-import itertools
-import re
+import json
 import sys
-from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 
 from agent_workflow import driver
-
-ids = itertools.count()
-
-
-def tool(name, **input):
-    return SimpleNamespace(type="tool_use", id=f"toolu_{next(ids)}", name=name, input=input)
-
-
-def text(value):
-    return SimpleNamespace(type="text", text=value)
-
-
-def reply(*blocks):
-    stop = "tool_use" if any(b.type == "tool_use" for b in blocks) else "end_turn"
-    usage = SimpleNamespace(input_tokens=100, output_tokens=50, cache_creation_input_tokens=0,
-                            cache_read_input_tokens=850)
-    return SimpleNamespace(content=list(blocks), stop_reason=stop, usage=usage)
-
-
-class FakeClient:
-    """Plays back one scripted list of responses per role, recording every request."""
-
-    def __init__(self, scripts):
-        self.scripts = scripts
-        self.requests = []
-        self.beta = SimpleNamespace(messages=self)
-
-    def stream(self, **request):
-        self.requests.append(request)
-        role = re.search(r"# Role: (.+)", request["system"][1]["text"]).group(1)
-        response = self.scripts[role].pop(0)
-        return contextlib.nullcontext(SimpleNamespace(get_final_message=lambda: response))
 
 
 @pytest.fixture
@@ -54,69 +20,68 @@ def run(server, repo):
     return run_id
 
 
-def report(run, role, status="done", summary="ok", **extra):
-    return reply(tool("task_report", run_id=run, task_id="T1", role=role, status=status,
-                      summary=summary, **extra))
+@pytest.fixture
+def fake_claude(tmp_path, monkeypatch):
+    """Returns a function that sets the per-role script and reads back the calls made."""
+    log, plan = tmp_path / "claude.log", tmp_path / "plan.json"
+    wrapper = tmp_path / "claude"
+    wrapper.write_text(f"#!/bin/sh\nexec {sys.executable} {Path(__file__).parent / 'fake_claude.py'} \"$@\"\n")
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("AGENT_WORKFLOW_CLAUDE", str(wrapper))
+    monkeypatch.setenv("FAKE_CLAUDE_LOG", str(log))
+    monkeypatch.setenv("FAKE_CLAUDE_PLAN", str(plan))
+
+    def script(steps):
+        plan.write_text(json.dumps(steps))
+        return lambda: [json.loads(line) for line in log.read_text().splitlines()]
+    return script
 
 
-def test_drives_a_run_to_the_end(run, repo):
+def report(run, role, status="done", summary="ok", artifacts=()):
+    return f"store.report({run!r}, 'T1', {role!r}, {status!r}, {summary!r}, {list(artifacts)!r})"
+
+
+def test_drives_a_run_to_the_end(run, repo, fake_claude):
     from agent_workflow import server as mcp
     report_id = mcp.store.put_artifact(run, "report", "T1 fixed value.txt")
-    client = FakeClient({
-        "coder": [
-            reply(tool(driver.EDITOR, command="str_replace", path="value.txt",
-                       old_str="broken", new_str="fixed"),
-                  tool(driver.EDITOR, command="view", path="../../escape.txt")),
-            reply(tool("bash", command="git commit -qam 'T1: fix value'")),
-            report(run, "coder", summary="set value to fixed"),
-            reply(text("set value to fixed")),
-        ],
-        "reviewer": [report(run, "reviewer", summary="clean"), reply(text("clean"))],
-        "integrator": [
-            reply(tool("task_merge", run_id=run, task_id="T1")),
-            reply(tool("run_report", run_id=run, role="integrator", status="done", summary="merged")),
-            reply(text("merged")),
-        ],
-        "scribe": [
-            reply(tool("run_report", run_id=run, role="scribe", status="done", summary="report",
-                       artifacts=[report_id])),
-            reply(text("report")),
-        ],
+    calls = fake_claude({
+        "coder": ["import subprocess; open('value.txt', 'w').write('fixed\\n'); "
+                  "subprocess.run(['git', 'commit', '-qam', 'T1: fix'], check=True); "
+                  + report(run, "coder")],
+        "reviewer": [report(run, "reviewer", summary="clean")],
+        "integrator": [f"gate.merge_worktree({str(repo)!r}, {run!r}, 'T1'); "
+                       f"store.record_run_result({run!r}, 'integrator', 'done', 'merged')"],
+        "scribe": [f"store.record_run_result({run!r}, 'scribe', 'done', 'report', [{report_id!r}])"],
     })
 
-    assert driver.drive(client, run) == report_id
+    assert driver.drive(run) == report_id
     assert (repo / "value.txt").read_text() == "fixed\n"
-    # Every response's usage is booked: 1000 tokens per response in the fake.
-    assert mcp.store.ledger(run)["by_role"] == {"coder": 4000, "reviewer": 2000,
-                                                "integrator": 3000, "scribe": 2000}
+    # Each agent's usage is booked: 150 fresh + 850 cache reads at a tenth = 235.
+    assert mcp.store.ledger(run)["by_role"] == {"coder": 235, "reviewer": 235,
+                                                "integrator": 235, "scribe": 235}
 
-    first = client.requests[0]
-    assert [b.get("cache_control") for b in first["system"]] == [{"type": "ephemeral"}] * 2
-    assert "check.py reads value.txt" in first["system"][0]["text"]
-    assert first["model"] == "claude-sonnet-5-5" and first["fallbacks"] == "default"
-    names = [t["name"] for t in first["tools"]]
-    assert names[:2] == ["bash", driver.EDITOR] and names[2:] == sorted(names[2:])
-    assert "task_report" in names and not driver.DRIVER_ONLY & set(names)
-    # Identical tools on every request keep the cached prefix shared across agents.
-    assert all(r["tools"] == first["tools"] for r in client.requests)
-    scribe = client.requests[-1]
-    assert scribe["model"] == "claude-haiku-5-5" and "fallbacks" not in scribe
-
-    edit, escape = client.requests[0]["messages"][2]["content"]  # results of the first turn
-    assert edit["is_error"] is False
-    assert escape["is_error"] is True and "outside" in escape["content"]
+    coder, *_, scribe = calls()
+    assert Path(coder["cwd"]) == mcp.home / "worktrees" / run / "T1"
+    argv = coder["argv"]
+    option = lambda name: argv[argv.index(name) + 1]
+    sandbox = json.loads(option("--settings"))["sandbox"]
+    assert sandbox["enabled"] and sandbox["failIfUnavailable"] and not sandbox["allowUnsandboxedCommands"]
+    assert option("--permission-mode") == "dontAsk" and option("--model") == "sonnet"
+    assert "--strict-mcp-config" in argv and "check.py reads value.txt" in option("--append-system-prompt")
+    denied = argv[argv.index("--disallowedTools") + 1:]
+    assert "mcp__agent-workflow__task_claim" in denied and "WebFetch" in denied
+    assert scribe["argv"][scribe["argv"].index("--model") + 1] == "haiku"
 
 
-def test_agent_that_never_reports_is_retried_once(run):
+def test_agent_that_never_reports_is_retried_once(run, fake_claude):
     from agent_workflow import server as mcp
-    client = FakeClient({"coder": [reply(text("done?")), reply(text("done?"))]})
+    fake_claude({"coder": ["pass", "pass"]})
     with pytest.raises(driver.DriverError, match="twice ended without reporting"):
-        driver.drive(client, run)
+        driver.drive(run)
     assert mcp.store.list_tasks(run)[0]["claimed_by"] is None
 
 
-def test_escalation_stops_the_driver(run):
-    client = FakeClient({"coder": [report(run, "coder", status="escalate", summary="needs a decision"),
-                                   reply(text("escalated"))]})
+def test_escalation_stops_the_driver(run, fake_claude):
+    fake_claude({"coder": [report(run, "coder", status="escalate", summary="needs a decision")]})
     with pytest.raises(driver.DriverError, match="no task can move: {'T1': 'escalated'}"):
-        driver.drive(client, run)
+        driver.drive(run)
