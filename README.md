@@ -67,7 +67,7 @@ Names: `scout`, `scribe`, `plan_critic`, `second_opinion` (high-risk diffs), `te
 
 ## License
 
-No license file yet, so all rights are reserved.
+This project is licensed under the [MIT License](LICENSE).
 
 ## Contact
 
