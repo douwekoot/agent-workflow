@@ -1,13 +1,13 @@
 # agent-workflow
 
-Local MCP server for coordinating multi-role agent runs. The Claude Code session agent
+Local MCP server for coordinating multi-role agent runs. Claude Code session agent
 acts as orchestrator and spawns the subagents. Server holds the shared state:
 
-- task
-- state machine
-- context packet per role
-- token budget
-- sandboxed test gate
+- Task
+- State machine
+- Context packet per role
+- Token budget
+- Sandboxed test gate
 
 Each task works in its own git worktree.
 
