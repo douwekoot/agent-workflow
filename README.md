@@ -11,6 +11,8 @@ acts as orchestrator and spawns the subagents. Server holds the shared state:
 
 Each task works in its own git worktree.
 
+<img width="2070" height="904" alt="image" src="https://github.com/user-attachments/assets/2f1f1109-a8af-418d-b83f-cc435d2e41b4" />
+
 ## Installation
 
 Needs Python 3.11+, git, [Claude Code](https://claude.com/claude-code) and `bwrap`
